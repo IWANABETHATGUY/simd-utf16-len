@@ -105,11 +105,26 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
             nb -= CHUNK;
         }
 
-        while nb >= LANES {
-            let v = _mm512_loadu_si512(sptr as *const __m512i);
-            count += LANES - cont!(v) + four!(v);
-            sptr = sptr.add(LANES);
-            nb -= LANES;
+        // Up to 3 leftover vectors: accumulate in vector registers and extract
+        // once, instead of paying a kmov+popcnt dependency chain per vector.
+        if nb >= LANES {
+            let zero = _mm512_setzero_si512();
+            let mut cont_acc = zero;
+            let mut four_acc = zero;
+            let mut vectors = 0usize;
+            while nb >= LANES {
+                let v = _mm512_loadu_si512(sptr as *const __m512i);
+                let cont_k = _mm512_cmpeq_epi8_mask(_mm512_and_si512(v, cont_mask), cont_val);
+                let four_k = _mm512_cmpge_epu8_mask(v, four_val);
+                cont_acc = _mm512_sub_epi8(cont_acc, _mm512_movm_epi8(cont_k));
+                four_acc = _mm512_sub_epi8(four_acc, _mm512_movm_epi8(four_k));
+                vectors += 1;
+                sptr = sptr.add(LANES);
+                nb -= LANES;
+            }
+            let cont_sum = _mm512_reduce_add_epi64(_mm512_sad_epu8(cont_acc, zero)) as usize;
+            let four_sum = _mm512_reduce_add_epi64(_mm512_sad_epu8(four_acc, zero)) as usize;
+            count += vectors * LANES - cont_sum + four_sum;
         }
 
         if nb > 0 {
@@ -196,11 +211,19 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
             nb -= batch * CHUNK;
         }
 
-        while nb >= LANES {
-            let v = _mm256_loadu_si256(sptr as *const __m256i);
-            count += (leader_bits!(v).count_ones() + four_bits!(v).count_ones()) as usize;
-            sptr = sptr.add(LANES);
-            nb -= LANES;
+        // Up to 3 leftover vectors: accumulate in vector registers and extract
+        // once, instead of paying a movemask+popcnt dependency chain per vector.
+        if nb >= LANES {
+            let mut leader_acc = zero;
+            let mut four_acc = zero;
+            while nb >= LANES {
+                let v = _mm256_loadu_si256(sptr as *const __m256i);
+                leader_acc = _mm256_sub_epi8(leader_acc, leader!(v));
+                four_acc = _mm256_sub_epi8(four_acc, four!(v));
+                sptr = sptr.add(LANES);
+                nb -= LANES;
+            }
+            count += sad_sum!(leader_acc) + sad_sum!(four_acc);
         }
 
         if nb > 0 {
@@ -287,11 +310,19 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
             nb -= batch * CHUNK;
         }
 
-        while nb >= LANES {
-            let v = _mm_loadu_si128(sptr as *const __m128i);
-            count += (leader_bits!(v).count_ones() + four_bits!(v).count_ones()) as usize;
-            sptr = sptr.add(LANES);
-            nb -= LANES;
+        // Up to 3 leftover vectors: accumulate in vector registers and extract
+        // once, instead of paying a movemask+popcnt dependency chain per vector.
+        if nb >= LANES {
+            let mut leader_acc = zero;
+            let mut four_acc = zero;
+            while nb >= LANES {
+                let v = _mm_loadu_si128(sptr as *const __m128i);
+                leader_acc = _mm_sub_epi8(leader_acc, leader!(v));
+                four_acc = _mm_sub_epi8(four_acc, four!(v));
+                sptr = sptr.add(LANES);
+                nb -= LANES;
+            }
+            count += sad_sum!(leader_acc) + sad_sum!(four_acc);
         }
 
         if nb > 0 {
