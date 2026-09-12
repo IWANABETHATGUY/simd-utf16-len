@@ -67,14 +67,23 @@ pub fn utf16_len(s: &str) -> usize {
         nb -= batch * CHUNK;
     }
 
-    while nb >= LANES {
-        // SAFETY: nb >= LANES, so the load stays in bounds.
-        let v = unsafe { v128_load(sptr as *const v128) };
-        count += LANES - (u8x16_bitmask(cont!(v)).count_ones() as usize)
-            + (u8x16_bitmask(four!(v)).count_ones() as usize);
-        // SAFETY: see above.
-        sptr = unsafe { sptr.add(LANES) };
-        nb -= LANES;
+    // Up to 3 leftover vectors: accumulate in vector registers and extract
+    // once, instead of paying a bitmask+popcnt dependency chain per vector.
+    if nb >= LANES {
+        let mut cont_acc = u8x16_splat(0);
+        let mut four_acc = u8x16_splat(0);
+        let mut vectors = 0usize;
+        while nb >= LANES {
+            // SAFETY: nb >= LANES, so the load stays in bounds.
+            let v = unsafe { v128_load(sptr as *const v128) };
+            cont_acc = u8x16_sub(cont_acc, cont!(v));
+            four_acc = u8x16_sub(four_acc, four!(v));
+            vectors += 1;
+            // SAFETY: see above.
+            sptr = unsafe { sptr.add(LANES) };
+            nb -= LANES;
+        }
+        count += vectors * LANES - horizontal_sum_u8(cont_acc) + horizontal_sum_u8(four_acc);
     }
 
     if nb > 0 {
