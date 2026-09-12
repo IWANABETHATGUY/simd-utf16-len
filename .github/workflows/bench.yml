@@ -21,4 +21,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Run benchmark comparison
-        run: cargo run --release --example bench_compare
+        run: cargo run --release --example bench_ab
