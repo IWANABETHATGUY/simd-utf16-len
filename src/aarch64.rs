@@ -12,6 +12,7 @@ use std::arch::aarch64::*;
 const LANE_INDEX: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// Compute the number of UTF-16 code units for UTF-8 string using NEON.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);

@@ -7,6 +7,7 @@
 use std::arch::wasm32::*;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using WASM SIMD128.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     const LANES: usize = 16;
     const CHUNK: usize = LANES * 4;
