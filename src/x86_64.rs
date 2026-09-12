@@ -9,6 +9,7 @@
 use std::arch::x86_64::*;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
