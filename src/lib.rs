@@ -13,28 +13,6 @@
 ))]
 mod ascii;
 
-#[cfg(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
-))]
-/// Count the tail after skipping continuation bytes at `i`.
-/// The caller has already counted each preceding leader's full UTF-16 contribution.
-///
-/// # Safety
-/// `bytes` must be valid UTF-8, and `i <= bytes.len()`.
-#[inline(always)]
-unsafe fn utf16_len_tail(bytes: &[u8], i: usize) -> usize {
-    let mut tail_start = i;
-    // SAFETY: the length check guards each byte access.
-    while tail_start < bytes.len() && (unsafe { *bytes.get_unchecked(tail_start) } & 0xC0) == 0x80 {
-        tail_start += 1;
-    }
-    // SAFETY: bytes is valid UTF-8, and tail_start <= bytes.len() is a char boundary.
-    let tail = unsafe { std::str::from_utf8_unchecked(bytes.get_unchecked(tail_start..)) };
-    tail.encode_utf16().count()
-}
-
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
