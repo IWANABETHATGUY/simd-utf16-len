@@ -17,13 +17,7 @@ pub fn utf16_len(s: &str) -> usize {
     }
     // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
     unsafe {
-        if is_x86_feature_detected!("avx512bw") {
-            utf16_len_avx512(bytes, start)
-        } else if is_x86_feature_detected!("avx2") {
-            utf16_len_avx2(bytes, start)
-        } else {
-            utf16_len_sse2(bytes, start)
-        }
+        utf16_len_avx2(bytes, start)
     }
 }
 
