@@ -23,17 +23,6 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
-/// Lane count of a 0x00/0xFF mask vector, via the vshrn bitmask trick from
-/// escape-simd's `bits.rs` (one nibble per lane) plus popcount. Counting is
-/// order-insensitive, so no endianness normalization is needed.
-#[inline(always)]
-unsafe fn mask_count(m: uint8x16_t) -> usize {
-    unsafe {
-        let sr4 = vshrn_n_u16(vreinterpretq_u16_u8(m), 4);
-        (vget_lane_u64(vreinterpret_u64_u8(sr4), 0).count_ones() >> 2) as usize
-    }
-}
-
 #[target_feature(enable = "neon")]
 unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 16;
@@ -88,11 +77,22 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             nb -= batch * CHUNK;
         }
 
-        while nb >= LANES {
-            let v = vld1q_u8(sptr);
-            count += LANES - mask_count(cont!(v)) + mask_count(four!(v));
-            sptr = sptr.add(LANES);
-            nb -= LANES;
+        // Up to 3 leftover vectors: accumulate in vector registers and extract
+        // once, instead of paying a vshrn+popcnt dependency chain per vector.
+        if nb >= LANES {
+            let mut cont_acc = vdupq_n_u8(0);
+            let mut four_acc = vdupq_n_u8(0);
+            let mut vectors = 0usize;
+            while nb >= LANES {
+                let v = vld1q_u8(sptr);
+                cont_acc = vsubq_u8(cont_acc, cont!(v));
+                four_acc = vsubq_u8(four_acc, four!(v));
+                vectors += 1;
+                sptr = sptr.add(LANES);
+                nb -= LANES;
+            }
+            count += vectors * LANES - vaddlvq_u8(cont_acc) as usize
+                + vaddlvq_u8(four_acc) as usize;
         }
 
         if nb > 0 {
@@ -112,9 +112,15 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
                 let keep = vcltq_u8(vld1q_u8(LANE_INDEX.as_ptr()), vdupq_n_u8(nb as u8));
                 (v, keep)
             };
-            let cont = mask_count(vandq_u8(cont!(v), keep));
-            let four = mask_count(vandq_u8(four!(v), keep));
-            count += nb - cont + four;
+            // UTF-16 units per kept lane: 1 - is_cont + is_four (0 elsewhere);
+            // one horizontal sum for the whole tail. `keep01` turns the 0xFF
+            // compare masks into 0/1 values for the arithmetic.
+            let keep01 = vandq_u8(keep, vdupq_n_u8(1));
+            let contrib = vsubq_u8(
+                vaddq_u8(keep01, vandq_u8(four!(v), keep01)),
+                vandq_u8(cont!(v), keep01),
+            );
+            count += vaddlvq_u8(contrib) as usize;
         }
 
         count
