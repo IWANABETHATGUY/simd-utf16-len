@@ -13,12 +13,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Pinned so runner image and compiler updates don't show up as performance changes.
         os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+          - ubuntu-24.04
+          - macos-26
+          - windows-2025
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
       - name: Run benchmark comparison
         run: cargo run --release --example bench_compare
