@@ -1,0 +1,58 @@
+name: Perf A/B
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref to compare against (empty means the parent commit, HEAD measures the no-change spread)
+        required: false
+        default: ""
+      macos:
+        description: Also run on macOS (report only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ab:
+    name: Perf A/B (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned so runner image and compiler updates don't show up as performance changes.
+        os: ${{ fromJSON(inputs.macos && '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-26"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Compare with base
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DISPATCH_BASE: ${{ inputs.base }}
+          AB_HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          # macOS runners are too noisy to fail on, and the label accepts an intended slowdown.
+          FAIL_ABOVE: ${{ !startsWith(matrix.os, 'macos') && !contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') && '10' || '' }}
+        run: |
+          case "$EVENT" in
+            # The merge commit's first parent is the tip of the base branch.
+            pull_request) base=HEAD^1 ;;
+            # Fall back to the parent when the previous tip was force-pushed away.
+            push) base=$PUSH_BEFORE; git cat-file -e "$base^{commit}" 2>/dev/null || base=HEAD^1 ;;
+            *) base=${DISPATCH_BASE:-HEAD^1} ;;
+          esac
+          scripts/perf-ab.sh "$base" --json perf-ab.json ${FAIL_ABOVE:+--fail-above "$FAIL_ABOVE"}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-ab-${{ matrix.os }}
+          path: perf-ab.json
+          if-no-files-found: ignore

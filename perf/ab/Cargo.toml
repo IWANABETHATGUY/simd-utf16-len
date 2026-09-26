@@ -1,0 +1,10 @@
+[package]
+name = "simd-utf16-len-ab"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+head = { package = "simd-utf16-len", path = "../.." }
+# Exported and renamed by scripts/perf-ab.sh.
+base = { package = "simd-utf16-len-base", path = "../../target/ab-base" }
