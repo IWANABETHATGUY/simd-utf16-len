@@ -3,7 +3,7 @@
 //! Runtime dispatch, as in napi-rs/json-escape-simd: AVX-512BW (only with the
 //! `avx512` feature) -> AVX2 -> SSE2, which is baseline on x86_64. Every
 //! kernel walks a pointer cursor with a remaining-byte count, counts four
-//! unrolled vectors per iteration into four byte-lane accumulators, folds the
+//! unrolled vectors per iteration into byte-lane accumulators, folds the
 //! leftover vectors and the tail into the same accumulators, and sums them
 //! once with `psadbw`. AVX2 and AVX-512 look up each byte's units by its high
 //! nibble with `pshufb`; SSE2 has no byte shuffle, so it compares. Inputs with
