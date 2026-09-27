@@ -41,7 +41,7 @@ Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller alr
 
 ## Benchmarks
 
-The [Benchmark workflow](.github/workflows/bench.yml), which runs only when started manually, runs [bench_compare](examples/bench_compare.rs) in release mode on Linux, macOS, and Windows. It compares `utf16_len` with this standard-library baseline, including an ASCII fast path:
+The [Perf A/B workflow](.github/workflows/perf-ab.yml) also compares `utf16_len` with this standard-library baseline, which skips counting for ASCII input:
 
 ```rust
 fn std_guard_len(s: &str) -> usize {
@@ -53,50 +53,36 @@ fn std_guard_len(s: &str) -> usize {
 }
 ```
 
-Results below are from [run 34220758753](https://github.com/SyMind/simd-utf16-len/actions/runs/34220758753) on **2026-09-08**, at commit [`a241509`](https://github.com/SyMind/simd-utf16-len/commit/a2415096978d0d3923d16fdf0711963a079f7506), using Rust **1.98.1**. Each measurement uses 1,000 warmup iterations followed by 10 samples of 10,000 iterations; the example reports the middle sorted sample as nanoseconds per iteration. Speedup is the baseline time divided by the SIMD time, as reported by the example.
+The speedups below are from [run 36311375947](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947) on **2026-09-27**, at commit `ace7793`, using Rust **1.98.1**. Speedup is the baseline's time divided by `utf16_len`'s time, taken as the median of 7 runs in fresh processes, so above 1x means `utf16_len` is faster. The job summaries also list the time per call. The runners were an AMD EPYC 7763 ([x86_64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838579)), a Neoverse-N2 ([aarch64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838670)), and an Apple M1 (Virtual) ([macOS job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838445)).
 
-These historical results predate the standard-library-aligned ASCII scanner; they do not describe the current ASCII path. For this run, the 169-byte ASCII input was **1.5–2.4x faster** than the ASCII guard, and the non-ASCII inputs were **8.8–13.1x faster** than the same baseline. Results depend on input length, character distribution, CPU, and compiler; these ratios do not establish a speedup for every string or platform.
+| Input | Bytes | Linux x86_64 | Linux aarch64 | macOS aarch64 |
+|:------|------:|-------------:|--------------:|--------------:|
+| ascii_tiny | 11 | 1.0x | 0.7x | 0.8x |
+| utf8_tiny | 13 | 0.7x | 0.8x | 0.9x |
+| ascii_short | 44 | 0.7x | 0.8x | 0.9x |
+| utf8_short | 53 | 2.7x | 3.0x | 3.1x |
+| ascii | 169 | 6.6x | 1.7x | 2.1x |
+| cjk | 194 | 7.9x | 8.3x | 9.9x |
+| emoji | 170 | 6.4x | 6.1x | 7.4x |
+| mixed | 144 | 9.8x | 6.9x | 11.6x |
+| cjk_tail3 | 195 | 7.4x | 7.5x | 8.0x |
+| cjk_tail15 | 207 | 5.5x | 5.4x | 5.8x |
+| ascii_large | 10816 | 0.7x | 2.1x | 4.1x |
+| cjk_large | 12416 | 15.4x | 12.3x | 13.0x |
+| emoji_large | 10880 | 19.2x | 12.0x | 16.5x |
+| mixed_large | 9216 | 18.0x | 11.5x | 17.5x |
+| early_non_ascii | 10818 | 21.6x | 15.6x | 15.6x |
+| late_non_ascii | 10818 | 40.5x | 35.7x | 49.9x |
 
-### Linux x86_64
-
-CPU: AMD EPYC 7763 64-Core Processor. [Job output](https://github.com/SyMind/simd-utf16-len/actions/runs/34220758753/job/102043054326).
-
-| Input | Bytes | SIMD (ns/iter) | std guard (ns/iter) | Speedup |
-|-------|------:|---------------:|--------------------:|--------:|
-| ascii |   169 |            6.8 |                16.4 |    2.4x |
-| cjk   |   194 |            9.9 |                91.0 |    9.2x |
-| emoji |   170 |            9.9 |               105.1 |   10.6x |
-| mixed |   144 |            8.0 |               101.7 |   12.7x |
-
-### macOS aarch64
-
-CPU: Apple M1 (Virtual). [Job output](https://github.com/SyMind/simd-utf16-len/actions/runs/34220758753/job/102043053876).
-
-| Input | Bytes | SIMD (ns/iter) | std guard (ns/iter) | Speedup |
-|-------|------:|---------------:|--------------------:|--------:|
-| ascii |   169 |            6.1 |                 9.2 |    1.5x |
-| cjk   |   194 |            8.5 |                92.0 |   10.8x |
-| emoji |   170 |           11.5 |               101.1 |    8.8x |
-| mixed |   144 |            7.3 |                96.1 |   13.1x |
-
-### Windows x86_64
-
-CPU: AMD EPYC 7763 64-Core Processor. [Job output](https://github.com/SyMind/simd-utf16-len/actions/runs/34220758753/job/102043054189).
-
-| Input | Bytes | SIMD (ns/iter) | std guard (ns/iter) | Speedup |
-|-------|------:|---------------:|--------------------:|--------:|
-| ascii |   169 |            8.4 |                16.4 |    2.0x |
-| cjk   |   194 |           10.8 |               111.8 |   10.3x |
-| emoji |   170 |           10.8 |               113.3 |   10.5x |
-| mixed |   144 |            9.0 |               106.6 |   11.9x |
+The baseline ties or wins on the inputs of 44 bytes or less (`ascii_tiny`, `utf8_tiny`, and `ascii_short`). On x86_64, its `is_ascii` also beats this crate's ASCII scan on the 10,816-byte ASCII input. Results depend on input length, character distribution, CPU, and compiler, so these ratios don't promise a speedup for every string or platform.
 
 ### Reproduce locally
 
 ```sh
-cargo run --release --example bench_compare
+scripts/perf-ab.sh HEAD
 ```
 
-Use `--release`: a plain `cargo run --example bench_compare` builds unoptimized code and does not reproduce the workflow's performance measurements. The example prints the build mode, OS, CPU, and Rust version alongside the results, and exits with an error if any SIMD result is slower than its baseline.
+With `HEAD` as the base, the first table shows the no-change spread on your machine, and the second compares your working tree with the standard library.
 
 ### Base-vs-PR check
 
@@ -112,7 +98,7 @@ scripts/perf-ab.sh main
 
 The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its first 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.
 
-The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check and `bench_compare` share.
+The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check also uses.
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 
