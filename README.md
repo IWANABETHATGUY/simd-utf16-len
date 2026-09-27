@@ -98,6 +98,16 @@ cargo run --release --example bench_compare
 
 Use `--release`: a plain `cargo run --example bench_compare` builds unoptimized code and does not reproduce the workflow's performance measurements. The example prints the build mode, OS, CPU, and Rust version alongside the results, and exits with an error if any SIMD result is slower than its baseline.
 
+### Base-vs-PR check
+
+The [Perf A/B workflow](.github/workflows/perf-ab.yml) builds `utf16_len` from the base commit and from the change into one binary, then times them in alternating batches on the same machine, so runner noise affects both sides equally. It runs for pull requests and pushes to `main` on Linux x86_64 and aarch64, and writes the median change per input to the job summary. It fails when an input gets more than 5% slower. To accept an intended slowdown, label the pull request `perf-regression-accepted`.
+
+Run the same comparison locally against any ref:
+
+```sh
+scripts/perf-ab.sh main
+```
+
 ### CodSpeed regression tracking
 
 The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.

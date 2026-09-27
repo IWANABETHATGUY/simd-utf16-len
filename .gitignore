@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Changes with the base ref under test
+/perf/ab/Cargo.lock
