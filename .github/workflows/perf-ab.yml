@@ -40,7 +40,7 @@ jobs:
           DISPATCH_BASE: ${{ inputs.base }}
           AB_HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
           # macOS runners are too noisy to fail on, and the label accepts an intended slowdown.
-          FAIL_ABOVE: ${{ !startsWith(matrix.os, 'macos') && !contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') && '10' || '' }}
+          FAIL_ABOVE: ${{ !startsWith(matrix.os, 'macos') && !contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') && '5' || '' }}
         run: |
           case "$EVENT" in
             # The merge commit's first parent is the tip of the base branch.
