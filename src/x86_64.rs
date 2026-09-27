@@ -51,7 +51,7 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
     }
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
     // and SSE2 is baseline on x86_64.
-    unsafe { utf16_len_sse2(bytes, start) }
+    unsafe { utf16_len_sse2_short(bytes, start) }
 }
 
 /// Runs the widest kernel this CPU supports.
@@ -412,5 +412,67 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
         start
             + (_mm_cvtsi128_si64(total) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(total, total)))
                 as usize
+    }
+}
+
+/// Experiment: `main`'s simple loop for inputs under `WIDE_MIN` bytes, with
+/// separate leader and four-byte accumulators and the in-register tail.
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn utf16_len_sse2_short(bytes: &[u8], start: usize) -> usize {
+    const LANES: usize = 16;
+
+    unsafe {
+        let len = bytes.len();
+        let mut sptr = bytes.as_ptr().add(start);
+        let mut nb = len - start;
+
+        let zero = _mm_setzero_si128();
+        let cont_max = _mm_set1_epi8(0xBF_u8 as i8);
+        let four_mask = _mm_set1_epi8(0xF0_u8 as i8);
+        let mut leader_acc = zero;
+        let mut four_acc = zero;
+
+        // Under WIDE_MIN bytes there are at most 16 vectors, so u8 lanes can't overflow.
+        while nb >= LANES {
+            let v = _mm_loadu_si128(sptr as *const __m128i);
+            leader_acc = _mm_sub_epi8(leader_acc, _mm_cmpgt_epi8(v, cont_max));
+            four_acc = _mm_sub_epi8(
+                four_acc,
+                _mm_cmpeq_epi8(_mm_and_si128(v, four_mask), four_mask),
+            );
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
+        if nb > 0 {
+            let index = _mm_loadu_si128(LANE_INDEX.as_ptr() as *const __m128i);
+            let (v, keep) =
+                if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
+                    let v = _mm_loadu_si128(
+                        bytes.as_ptr().wrapping_add(len).wrapping_sub(LANES) as *const __m128i
+                    );
+                    (
+                        v,
+                        _mm_cmpgt_epi8(index, _mm_set1_epi8((LANES - nb - 1) as i8)),
+                    )
+                } else {
+                    let v = if crate::OVERREAD {
+                        _mm_loadu_si128(sptr as *const __m128i)
+                    } else {
+                        let mut placeholder = [0u8; LANES];
+                        std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                        _mm_loadu_si128(placeholder.as_ptr() as *const __m128i)
+                    };
+                    (v, _mm_cmpgt_epi8(_mm_set1_epi8(nb as i8), index))
+                };
+            leader_acc = _mm_sub_epi8(leader_acc, _mm_and_si128(_mm_cmpgt_epi8(v, cont_max), keep));
+            four_acc = _mm_sub_epi8(
+                four_acc,
+                _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(v, four_mask), four_mask), keep),
+            );
+        }
+
+        let sad = _mm_add_epi64(_mm_sad_epu8(leader_acc, zero), _mm_sad_epu8(four_acc, zero));
+        start + (_mm_cvtsi128_si64(sad) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(sad, sad))) as usize
     }
 }
