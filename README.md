@@ -26,7 +26,7 @@ Where:
 - **Continuation bytes** (`(byte & 0xC0) == 0x80`) don't produce UTF-16 code units
 - **Four-byte leaders** (`byte >= 0xF0`) produce surrogate pairs (2 UTF-16 code units instead of 1)
 
-The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted using 16-byte SIMD vectors. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
+The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted with SIMD kernels modeled on [napi-rs/json-escape-simd](https://github.com/napi-rs/json-escape-simd): a pointer cursor with a remaining-byte count, four unrolled vectors per iteration counted into byte-lane accumulators, and one horizontal sum per call. AVX2, AVX-512, NEON, and simd128 look up each byte's UTF-16 units by its high nibble with a byte shuffle, the way json-escape-simd's nibble-table classifier works; SSE2 has no byte shuffle, so it compares. The last bytes come from an overlapping load of the final vector, masked with a static lane table, or from a fault-suppressing masked load under AVX-512. Inputs shorter than one vector load past their end when that stays within the memory page, in release builds on Linux, macOS, and Windows, instead of copying into a buffer. On x86_64, inputs with fewer than 256 bytes after the prefix stay on the SSE2 kernel inlined into the dispatch, since a wider kernel's call and reduction cost more than they save there. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
 
 Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller already guarantees or caches that a string is ASCII, `s.len()` remains an O(1) operation and avoids scanning altogether.
 
@@ -34,7 +34,7 @@ Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller alr
 
 | Architecture | SIMD | Instruction set |
 |-------------|------|-----------------|
-| x86_64 | SSE2 | Available by default on this architecture |
+| x86_64 | AVX2 / SSE2, or AVX-512BW with the `avx512` feature | Runtime dispatch; SSE2 available by default on this architecture |
 | aarch64 | NEON | Available by default on this architecture |
 | wasm32 | simd128 | Requires `target_feature = "simd128"` |
 | Other | — | Falls back to `encode_utf16().count()` |
@@ -98,11 +98,19 @@ scripts/perf-ab.sh main
 
 The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its first 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.
 
-The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check also uses.
+The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one accumulator batch, and long ASCII with one non-ASCII character at the start or end. The `kernel` group times each kernel the machine supports on the non-ASCII inputs, since ASCII input returns before any kernel runs. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check also uses.
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 
-The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback.
+### Kernel sweep
+
+The [Kernel sweep workflow](.github/workflows/kernels.yml) times every kernel a runner supports, and the `utf16_len` dispatch, on non-ASCII inputs from 13 bytes to 16 KiB, to show where a wider kernel starts to pay off. It runs on demand. Locally:
+
+```sh
+cargo run --release --manifest-path perf/kernels/Cargo.toml --features avx512
+```
+
+The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks. Most runners don't expose AVX-512, so one job runs the tests with the `avx512` feature under Intel's Software Development Emulator as a Sapphire Rapids CPU and fails if any x86_64 kernel is missing. The tests also run in release builds, where short inputs read past their end instead of being copied.
 
 ## License
 
