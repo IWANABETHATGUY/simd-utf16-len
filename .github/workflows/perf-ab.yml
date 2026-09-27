@@ -25,8 +25,12 @@ jobs:
         # Pinned so runner image and compiler updates don't show up as performance changes.
         os:
           - ubuntu-24.04
-          - ubuntu-24.04-arm
+          - windows-2025
           - macos-26
+    defaults:
+      run:
+        # Windows runners default to PowerShell; the steps and script need bash.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:

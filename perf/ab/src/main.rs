@@ -385,7 +385,16 @@ fn cpu_model() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var("PROCESSOR_IDENTIFIER").ok()
+        // PROCESSOR_IDENTIFIER only has the family and model numbers.
+        command_output(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Processor).Name",
+            ],
+        )
+        .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
