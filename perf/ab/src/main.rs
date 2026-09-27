@@ -55,6 +55,16 @@ impl Measurement {
     fn change(&self, p: f64) -> f64 {
         percentile(&self.ratios, p) - 1.0
     }
+
+    fn slower_runs(&self) -> usize {
+        self.ratios.iter().filter(|&&ratio| ratio > 1.0).count()
+    }
+
+    /// Noisy inputs can put the median past the limit with no code change, but
+    /// their runs then disagree, so a regression must also slow every run.
+    fn regressed(&self, limit: f64) -> bool {
+        self.change(0.5) * 100.0 > limit && self.slower_runs() == self.ratios.len()
+    }
 }
 
 fn main() -> ExitCode {
@@ -94,7 +104,7 @@ fn main() -> ExitCode {
     let regressions: Vec<_> = match options.fail_above {
         Some(limit) => results
             .iter()
-            .filter(|m| m.change(0.5) * 100.0 > limit)
+            .filter(|m| m.regressed(limit))
             .map(|m| m.name)
             .collect(),
         None => Vec::new(),
@@ -385,16 +395,12 @@ fn markdown(
         options.rounds,
     )
     .unwrap();
-    out.push_str(
-        "| Input | Bytes | Base ns/call | Head ns/call | Time change | Range across runs |\n",
-    );
-    out.push_str(
-        "|:------|------:|-------------:|-------------:|------------:|------------------:|\n",
-    );
+    out.push_str("| Input | Bytes | Base ns/call | Head ns/call | Time change | Range across runs | Slower runs |\n");
+    out.push_str("|:------|------:|-------------:|-------------:|------------:|------------------:|------------:|\n");
     for m in results {
         writeln!(
             out,
-            "| {} | {} | {:.1} | {:.1} | {} | {} to {} |",
+            "| {} | {} | {:.1} | {:.1} | {} | {} to {} | {}/{} |",
             m.name,
             m.bytes,
             m.base_ns,
@@ -402,6 +408,8 @@ fn markdown(
             percent(m.change(0.5)),
             percent(m.change(0.0)),
             percent(m.change(1.0)),
+            m.slower_runs(),
+            m.ratios.len(),
         )
         .unwrap();
     }
@@ -409,11 +417,20 @@ fn markdown(
     match options.fail_above {
         None => out.push_str("Report only: no failure threshold was set.\n"),
         Some(limit) if regressions.is_empty() => {
-            writeln!(out, "No input got more than {limit}% slower.").unwrap();
+            writeln!(
+                out,
+                "No input got more than {limit}% slower with every run agreeing."
+            )
+            .unwrap();
         }
         Some(limit) => {
             let names: Vec<_> = regressions.iter().map(|name| format!("`{name}`")).collect();
-            writeln!(out, "**More than {limit}% slower:** {}", names.join(", ")).unwrap();
+            writeln!(
+                out,
+                "**More than {limit}% slower, with every run agreeing:** {}",
+                names.join(", ")
+            )
+            .unwrap();
         }
     }
     out
@@ -453,7 +470,7 @@ fn json(
         let separator = if i + 1 < results.len() { "," } else { "" };
         writeln!(
             out,
-            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"change_pct\": {:.2}, \"min_pct\": {:.2}, \"max_pct\": {:.2}}}{separator}",
+            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"change_pct\": {:.2}, \"min_pct\": {:.2}, \"max_pct\": {:.2}, \"slower_runs\": {}}}{separator}",
             quote(m.name),
             m.bytes,
             m.base_ns,
@@ -461,6 +478,7 @@ fn json(
             m.change(0.5) * 100.0,
             m.change(0.0) * 100.0,
             m.change(1.0) * 100.0,
+            m.slower_runs(),
         )
         .unwrap();
     }
