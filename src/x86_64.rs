@@ -28,6 +28,57 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
+/// SSE2, then AVX2 and AVX-512 when this CPU has them, in the order
+/// `utf16_len` prefers them last.
+pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
+    use crate::__kernels::Kernel;
+    let mut kernels = vec![Kernel {
+        name: "sse2",
+        utf16_len: sse2,
+    }];
+    if is_x86_feature_detected!("avx2") {
+        kernels.push(Kernel {
+            name: "avx2",
+            utf16_len: avx2,
+        });
+    }
+    if is_x86_feature_detected!("avx512bw") {
+        kernels.push(Kernel {
+            name: "avx512",
+            utf16_len: avx512,
+        });
+    }
+    kernels
+}
+
+/// The ASCII prefix scan, then `kernel` on the rest, like `utf16_len`.
+#[inline(always)]
+fn with_kernel(s: &str, kernel: impl FnOnce(&[u8], usize) -> usize) -> usize {
+    let bytes = s.as_bytes();
+    let start = crate::ascii::ascii_prefix_len(bytes);
+    if start == bytes.len() {
+        start
+    } else {
+        kernel(bytes, start)
+    }
+}
+
+fn sse2(s: &str) -> usize {
+    // SAFETY: SSE2 is baseline on x86_64, and with_kernel passes a valid str's
+    // bytes with a verified ASCII prefix.
+    with_kernel(s, |bytes, start| unsafe { utf16_len_sse2(bytes, start) })
+}
+
+fn avx2(s: &str) -> usize {
+    // SAFETY: `kernels` only lists this after detecting AVX2.
+    with_kernel(s, |bytes, start| unsafe { utf16_len_avx2(bytes, start) })
+}
+
+fn avx512(s: &str) -> usize {
+    // SAFETY: `kernels` only lists this after detecting AVX-512BW.
+    with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
+}
+
 /// UTF-16 units contributed by the last `nb` bytes of `bytes`, given the
 /// per-lane leader/four-leader bitmasks of the vector holding them.
 ///

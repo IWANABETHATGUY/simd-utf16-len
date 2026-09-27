@@ -43,3 +43,17 @@ jobs:
         env:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+  sde:
+    name: Test (x86_64 kernels, Intel SDE)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: petarpetrovt/setup-sde@v6.0
+      # Most runners don't expose AVX-512, so emulate a Sapphire Rapids CPU,
+      # which has it, and require every x86_64 kernel to run.
+      - run: cargo test --lib
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.SDE_PATH }}/sde64 -spr --
+          SIMD_UTF16_LEN_EXPECT_KERNELS: sse2,avx2,avx512

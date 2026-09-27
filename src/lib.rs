@@ -45,9 +45,87 @@ pub use wasm32::utf16_len;
 )))]
 pub use scalar::utf16_len;
 
+/// The kernels behind `utf16_len`, for this crate's tests and benchmarks.
+/// Not part of the public API.
+#[doc(hidden)]
+pub mod __kernels {
+    /// One kernel, including the ASCII prefix scan that runs before it.
+    pub struct Kernel {
+        pub name: &'static str,
+        pub utf16_len: fn(&str) -> usize,
+    }
+
+    /// Every kernel this CPU supports. `utf16_len` runs the last one.
+    pub fn available() -> Vec<Kernel> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::x86_64::kernels()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vec![Kernel {
+                name: "neon",
+                utf16_len: crate::aarch64::utf16_len,
+            }]
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            vec![Kernel {
+                name: "simd128",
+                utf16_len: crate::wasm32::utf16_len,
+            }]
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128"),
+        )))]
+        {
+            vec![Kernel {
+                name: "scalar",
+                utf16_len: crate::scalar::utf16_len,
+            }]
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::utf16_len;
+    /// `crate::utf16_len`, after checking that every kernel this CPU supports
+    /// agrees with it, so each test below covers all of them.
+    #[track_caller]
+    fn utf16_len(s: &str) -> usize {
+        let result = super::utf16_len(s);
+        for kernel in super::__kernels::available() {
+            assert_eq!(
+                (kernel.utf16_len)(s),
+                result,
+                "{} kernel disagrees on {} bytes",
+                kernel.name,
+                s.len()
+            );
+        }
+        result
+    }
+
+    // CI sets this where a kernel must run, so an emulator or runner that hides
+    // a CPU feature fails here instead of silently skipping that kernel.
+    #[test]
+    fn expected_kernels_are_available() {
+        let Ok(expected) = std::env::var("SIMD_UTF16_LEN_EXPECT_KERNELS") else {
+            return;
+        };
+        let available: Vec<_> = super::__kernels::available()
+            .iter()
+            .map(|kernel| kernel.name)
+            .collect();
+        for name in expected.split(',') {
+            assert!(
+                available.contains(&name),
+                "{name} kernel is not available; found {available:?}"
+            );
+        }
+    }
 
     /// Reference implementation using the standard library.
     fn reference(s: &str) -> usize {

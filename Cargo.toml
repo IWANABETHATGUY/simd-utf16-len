@@ -21,3 +21,7 @@ harness = false
 [[bench]]
 name = "code_path"
 harness = false
+
+[[bench]]
+name = "kernel"
+harness = false
