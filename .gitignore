@@ -27,3 +27,6 @@ target
 
 # Changes with the base ref under test
 /perf/ab/Cargo.lock
+
+# Changes with the dependency path under test
+/perf/kernels/Cargo.lock

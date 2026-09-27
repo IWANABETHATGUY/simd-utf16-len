@@ -1,0 +1,8 @@
+[package]
+name = "simd-utf16-len-kernels"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+simd-utf16-len = { path = "../.." }

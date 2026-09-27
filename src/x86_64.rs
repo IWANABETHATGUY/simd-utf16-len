@@ -16,6 +16,14 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
+/// The kernels `utf16_len` can run on this CPU: SSE2, which is baseline.
+pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
+    vec![crate::__kernels::Kernel {
+        name: "sse2",
+        utf16_len,
+    }]
+}
+
 /// Count UTF-8 bytes after a verified ASCII prefix, including short inputs.
 ///
 /// # Safety
