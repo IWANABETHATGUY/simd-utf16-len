@@ -38,7 +38,7 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
     const CHUNK: usize = LANES * 4;
 
     // SAFETY: NEON is baseline on aarch64. Each full-vector load stays within
-    // the input, the placeholder, or the mask table, except the short-input
+    // the input, the mask table, or the placeholder, except the short-input
     // load, which stays within the input's page.
     unsafe {
         let len = bytes.len();
@@ -84,26 +84,30 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             nb -= LANES;
         }
         if nb > 0 {
-            let (v, keep) = if len >= LANES {
-                // The vector that ends at the input's end: only its last nb
-                // lanes are uncounted. Byte-wise counting needs no UTF-8
-                // boundary care.
-                (
-                    vld1q_u8(bytes.as_ptr().add(len - LANES)),
-                    vld1q_u8(crate::keep_last(LANES, nb)),
-                )
-            } else if crate::OVERREAD && crate::fits_in_page(sptr, LANES) {
-                // The whole input is shorter than a vector: read past its end,
-                // within its page.
-                (vld1q_u8(sptr), vld1q_u8(crate::keep_first(nb)))
-            } else {
-                let mut placeholder = [0u8; LANES];
-                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                (
-                    vld1q_u8(placeholder.as_ptr()),
-                    vld1q_u8(crate::keep_first(nb)),
-                )
-            };
+            // The vector that ends at the input's end, when the input holds a
+            // whole vector: only its last nb lanes are uncounted, and
+            // byte-wise counting needs no UTF-8 boundary care. A shorter
+            // input reads a full vector forward from its start when that
+            // stays within its page, or else the vector that ends at its
+            // end, which starts before the input but within the same page,
+            // so neither load can fault. Debug builds and Miri copy into a
+            // zeroed placeholder instead.
+            let (v, keep) =
+                if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
+                    (
+                        vld1q_u8(bytes.as_ptr().wrapping_add(len).wrapping_sub(LANES)),
+                        vld1q_u8(crate::keep_last(LANES, nb)),
+                    )
+                } else if crate::OVERREAD {
+                    (vld1q_u8(sptr), vld1q_u8(crate::keep_first(nb)))
+                } else {
+                    let mut placeholder = [0u8; LANES];
+                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                    (
+                        vld1q_u8(placeholder.as_ptr()),
+                        vld1q_u8(crate::keep_first(nb)),
+                    )
+                };
             a1 = vaddq_u8(a1, vandq_u8(units!(v), keep));
         }
 

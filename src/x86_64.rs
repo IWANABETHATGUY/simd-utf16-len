@@ -19,8 +19,15 @@ use std::arch::x86_64::*;
 const MAX_BATCH: usize = 30;
 
 /// Below this many bytes after the ASCII prefix, the inlined SSE2 kernel
-/// beats calling a wider one.
-const WIDE_MIN: usize = 256;
+/// beats calling the AVX2 kernel, as measured by the kernel sweep on Zen 3
+/// and Granite Rapids.
+const WIDE_MIN: usize = 64;
+
+/// Below this many bytes after the ASCII prefix, the AVX2 kernel beats the
+/// AVX-512 kernel, whose 64-byte vectors and wider reduction only pay off
+/// on longer inputs.
+#[cfg(feature = "avx512")]
+const AVX512_MIN: usize = 256;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
 #[inline]
@@ -37,39 +44,31 @@ pub fn utf16_len(s: &str) -> usize {
 /// Counts the bytes after the ASCII prefix. Out of line, like
 /// json-escape-simd's dispatch, so callers that inline the ASCII scan above
 /// stay small; short inputs then run the SSE2 kernel here with no further
-/// call or feature check.
+/// call, and longer ones tail-call the widest kernel this CPU supports.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
-    if bytes.len() - start >= WIDE_MIN {
-        return wide(bytes, start);
-    }
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
-    // and SSE2 is baseline on x86_64.
-    unsafe { utf16_len_sse2(bytes, start) }
-}
-
-/// Runs the widest kernel this CPU supports.
-#[inline(never)]
-fn wide(bytes: &[u8], start: usize) -> usize {
-    // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
-    // and each kernel runs only when the CPU supports its features.
+    // SSE2 is baseline on x86_64, and each wider kernel runs only when the
+    // CPU supports its features.
     unsafe {
-        #[cfg(feature = "avx512")]
-        {
-            if is_x86_feature_detected!("avx512bw") {
-                return utf16_len_avx512(bytes, start);
+        let nb = bytes.len() - start;
+        if nb >= WIDE_MIN {
+            #[cfg(feature = "avx512")]
+            {
+                if nb >= AVX512_MIN && is_x86_feature_detected!("avx512bw") {
+                    return utf16_len_avx512(bytes, start);
+                }
+            }
+            if is_x86_feature_detected!("avx2") {
+                return utf16_len_avx2(bytes, start);
             }
         }
-        if is_x86_feature_detected!("avx2") {
-            utf16_len_avx2(bytes, start)
-        } else {
-            utf16_len_sse2(bytes, start)
-        }
+        utf16_len_sse2(bytes, start)
     }
 }
 
 /// SSE2, then AVX2 and AVX-512 when this CPU has them (AVX-512 only with the
-/// `avx512` feature). `utf16_len` runs the last one from `WIDE_MIN` bytes on.
+/// `avx512` feature), in the order `utf16_len` prefers them for long inputs.
 pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
     use crate::__kernels::Kernel;
     let mut kernels = vec![Kernel {
@@ -123,6 +122,38 @@ fn avx512(s: &str) -> usize {
     with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
 }
 
+/// The vector holding the last `nb` bytes of `bytes`, and the mask of the
+/// lanes among them that are still uncounted, as `$load` produces them.
+///
+/// It is the vector that ends at the input's end when the input holds at
+/// least `$lanes` bytes: only its last `nb` lanes are uncounted, and byte-wise
+/// counting needs no UTF-8 boundary care. A shorter input reads a full vector
+/// forward from its start when that stays within its page, or else the vector
+/// that ends at its end, which then starts before the input but within the
+/// same page, so neither load can fault. Debug builds and Miri copy the input
+/// into a zeroed placeholder instead.
+///
+/// Must be expanded inside an `unsafe` block, with `$sptr` pointing at the
+/// last `nb` bytes of `bytes`, `0 < nb < $lanes`, and `$lanes <= 64`.
+macro_rules! tail_vector {
+    ($bytes:expr, $sptr:expr, $nb:expr, $lanes:expr, $load:expr) => {{
+        let (bytes, sptr, nb): (&[u8], *const u8, usize) = ($bytes, $sptr, $nb);
+        let len = bytes.len();
+        if len >= $lanes || (crate::OVERREAD && !crate::fits_in_page(sptr, $lanes)) {
+            (
+                $load(bytes.as_ptr().wrapping_add(len).wrapping_sub($lanes)),
+                $load(crate::keep_last($lanes, nb)),
+            )
+        } else if crate::OVERREAD {
+            ($load(sptr), $load(crate::keep_first(nb)))
+        } else {
+            let mut placeholder = [0u8; $lanes];
+            std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+            ($load(placeholder.as_ptr()), $load(crate::keep_first(nb)))
+        }
+    }};
+}
+
 /// SSE2 kernel, `#[inline(always)]` so short inputs run it inside `non_ascii`
 /// with no call.
 ///
@@ -134,22 +165,17 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
     const CHUNK: usize = LANES * 4;
 
     // SAFETY: SSE2 is baseline on x86_64. Each full-vector load stays within
-    // the input, the placeholder, or the mask table, except the short-input
+    // the input, the mask table, or the placeholder, except the short-input
     // load, which stays within the input's page.
     unsafe {
-        let len = bytes.len();
         let mut sptr = bytes.as_ptr().add(start);
-        let mut nb = len - start;
+        let mut nb = bytes.len() - start;
 
         let zero = _mm_setzero_si128();
         let cont_max = _mm_set1_epi8(0xBF_u8 as i8);
         let four = _mm_set1_epi8(0xF0_u8 as i8);
 
-        macro_rules! load {
-            ($p:expr) => {
-                _mm_loadu_si128($p as *const __m128i)
-            };
-        }
+        let load = |p: *const u8| _mm_loadu_si128(p as *const __m128i);
         // Minus the units each byte contributes: -1 for a leader (any byte
         // above the continuation range, compared as signed bytes), and -1
         // more for a four-byte leader.
@@ -174,10 +200,10 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
         while nb >= CHUNK {
             let batch = (nb / CHUNK).min(MAX_BATCH);
             for _ in 0..batch {
-                a0 = _mm_sub_epi8(a0, neg_units!(load!(sptr)));
-                a1 = _mm_sub_epi8(a1, neg_units!(load!(sptr.add(LANES))));
-                a2 = _mm_sub_epi8(a2, neg_units!(load!(sptr.add(LANES * 2))));
-                a3 = _mm_sub_epi8(a3, neg_units!(load!(sptr.add(LANES * 3))));
+                a0 = _mm_sub_epi8(a0, neg_units!(load(sptr)));
+                a1 = _mm_sub_epi8(a1, neg_units!(load(sptr.add(LANES))));
+                a2 = _mm_sub_epi8(a2, neg_units!(load(sptr.add(LANES * 2))));
+                a3 = _mm_sub_epi8(a3, neg_units!(load(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
             }
             nb -= batch * CHUNK;
@@ -188,28 +214,12 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
             }
         }
         while nb >= LANES {
-            a0 = _mm_sub_epi8(a0, neg_units!(load!(sptr)));
+            a0 = _mm_sub_epi8(a0, neg_units!(load(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }
         if nb > 0 {
-            let (v, keep) = if len >= LANES {
-                // The vector that ends at the input's end: only its last nb
-                // lanes are uncounted. Byte-wise counting needs no UTF-8
-                // boundary care.
-                (
-                    load!(bytes.as_ptr().add(len - LANES)),
-                    load!(crate::keep_last(LANES, nb)),
-                )
-            } else if crate::OVERREAD && crate::fits_in_page(sptr, LANES) {
-                // The whole input is shorter than a vector: read past its end,
-                // within its page.
-                (load!(sptr), load!(crate::keep_first(nb)))
-            } else {
-                let mut placeholder = [0u8; LANES];
-                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
-            };
+            let (v, keep) = tail_vector!(bytes, sptr, nb, LANES, load);
             a1 = _mm_sub_epi8(a1, _mm_and_si128(neg_units!(v), keep));
         }
 
@@ -233,12 +243,11 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
     const CHUNK: usize = LANES * 4;
 
     // SAFETY: the caller checked AVX2. Each full-vector load stays within the
-    // input, the placeholder, or the mask table, except the short-input load,
+    // input, the mask table, or the placeholder, except the short-input load,
     // which stays within the input's page.
     unsafe {
-        let len = bytes.len();
         let mut sptr = bytes.as_ptr().add(start);
-        let mut nb = len - start;
+        let mut nb = bytes.len() - start;
 
         let zero = _mm256_setzero_si256();
         let nibble = _mm256_set1_epi8(0x0F);
@@ -246,11 +255,7 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
             crate::UNITS_BY_HIGH_NIBBLE.as_ptr() as *const __m128i,
         ));
 
-        macro_rules! load {
-            ($p:expr) => {
-                _mm256_loadu_si256($p as *const __m256i)
-            };
-        }
+        let load = |p: *const u8| _mm256_loadu_si256(p as *const __m256i);
         macro_rules! units {
             ($v:expr) => {
                 _mm256_shuffle_epi8(table, _mm256_and_si256(_mm256_srli_epi16::<4>($v), nibble))
@@ -268,10 +273,10 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
         while nb >= CHUNK {
             let batch = (nb / CHUNK).min(MAX_BATCH);
             for _ in 0..batch {
-                a0 = _mm256_add_epi8(a0, units!(load!(sptr)));
-                a1 = _mm256_add_epi8(a1, units!(load!(sptr.add(LANES))));
-                a2 = _mm256_add_epi8(a2, units!(load!(sptr.add(LANES * 2))));
-                a3 = _mm256_add_epi8(a3, units!(load!(sptr.add(LANES * 3))));
+                a0 = _mm256_add_epi8(a0, units!(load(sptr)));
+                a1 = _mm256_add_epi8(a1, units!(load(sptr.add(LANES))));
+                a2 = _mm256_add_epi8(a2, units!(load(sptr.add(LANES * 2))));
+                a3 = _mm256_add_epi8(a3, units!(load(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
             }
             nb -= batch * CHUNK;
@@ -282,27 +287,12 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
             }
         }
         while nb >= LANES {
-            a0 = _mm256_add_epi8(a0, units!(load!(sptr)));
+            a0 = _mm256_add_epi8(a0, units!(load(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }
         if nb > 0 {
-            let (v, keep) = if len >= LANES {
-                // The vector that ends at the input's end: only its last nb
-                // lanes are uncounted.
-                (
-                    load!(bytes.as_ptr().add(len - LANES)),
-                    load!(crate::keep_last(LANES, nb)),
-                )
-            } else if crate::OVERREAD && crate::fits_in_page(sptr, LANES) {
-                // The whole input is shorter than a vector: read past its end,
-                // within its page.
-                (load!(sptr), load!(crate::keep_first(nb)))
-            } else {
-                let mut placeholder = [0u8; LANES];
-                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
-            };
+            let (v, keep) = tail_vector!(bytes, sptr, nb, LANES, load);
             a1 = _mm256_add_epi8(a1, _mm256_and_si256(units!(v), keep));
         }
 
@@ -342,11 +332,7 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
             crate::UNITS_BY_HIGH_NIBBLE.as_ptr() as *const __m128i
         ));
 
-        macro_rules! load {
-            ($p:expr) => {
-                _mm512_loadu_si512($p as *const __m512i)
-            };
-        }
+        let load = |p: *const u8| _mm512_loadu_si512(p as *const __m512i);
         macro_rules! units {
             ($v:expr) => {
                 _mm512_shuffle_epi8(table, _mm512_and_si512(_mm512_srli_epi16::<4>($v), nibble))
@@ -364,10 +350,10 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
         while nb >= CHUNK {
             let batch = (nb / CHUNK).min(MAX_BATCH);
             for _ in 0..batch {
-                a0 = _mm512_add_epi8(a0, units!(load!(sptr)));
-                a1 = _mm512_add_epi8(a1, units!(load!(sptr.add(LANES))));
-                a2 = _mm512_add_epi8(a2, units!(load!(sptr.add(LANES * 2))));
-                a3 = _mm512_add_epi8(a3, units!(load!(sptr.add(LANES * 3))));
+                a0 = _mm512_add_epi8(a0, units!(load(sptr)));
+                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES))));
+                a2 = _mm512_add_epi8(a2, units!(load(sptr.add(LANES * 2))));
+                a3 = _mm512_add_epi8(a3, units!(load(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
             }
             nb -= batch * CHUNK;
@@ -378,7 +364,7 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
             }
         }
         while nb >= LANES {
-            a0 = _mm512_add_epi8(a0, units!(load!(sptr)));
+            a0 = _mm512_add_epi8(a0, units!(load(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }

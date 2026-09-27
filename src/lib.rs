@@ -92,9 +92,10 @@ fn keep_first(nb: usize) -> *const u8 {
 
 /// Whether an input shorter than one vector may be read with a full-vector
 /// load that reaches past its end, as napi-rs/json-escape-simd does on Linux
-/// and macOS. Windows also protects memory in 4 KiB pages. The kernels only do
-/// so when the load stays within the input's page, so it can't fault. Debug
-/// builds and Miri copy into a buffer instead, since they would flag the read.
+/// and macOS, or past its start. Windows also protects memory in 4 KiB pages.
+/// The kernels only do so when the load stays within the input's page, so it
+/// can't fault. Debug builds and Miri copy into a buffer instead, since they
+/// would flag the read.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const OVERREAD: bool = cfg!(all(
     any(
