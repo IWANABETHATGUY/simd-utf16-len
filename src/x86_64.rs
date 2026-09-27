@@ -42,7 +42,7 @@ const WIDE_MIN: usize = 256;
 /// Runs the best kernel after the ASCII prefix. Kept out of line, like
 /// napi-rs/json-escape-simd's dispatch, so the feature checks don't grow the
 /// callers that inline the ASCII scan above.
-#[inline(never)]
+#[inline]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
     // and each kernel only runs when the CPU supports its features.
