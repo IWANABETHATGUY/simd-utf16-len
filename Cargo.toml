@@ -10,7 +10,8 @@ autobenches = false
 
 [dependencies]
 
-[dev-dependencies]
+# Criterion doesn't build for wasm32, and the unit tests don't need it.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "4.7" }
 
 [[bench]]
