@@ -1,7 +1,6 @@
 name: Kernel sweep
 
 on:
-  pull_request:
   workflow_dispatch:
 
 permissions:
