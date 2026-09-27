@@ -100,7 +100,7 @@ Use `--release`: a plain `cargo run --example bench_compare` builds unoptimized 
 
 ### Base-vs-PR check
 
-The [Perf A/B workflow](.github/workflows/perf-ab.yml) builds `utf16_len` from the base commit and from the change into one binary, then times them in alternating batches on the same machine, so runner noise affects both sides equally. It repeats this in 7 fresh processes and uses the median, because where the code lands in memory can shift one process's result for short inputs. It runs for pull requests and pushes to `main` on Linux x86_64 and aarch64, and writes the median change per input to the job summary. It fails when an input's median is more than 5% slower and every run agrees that it's slower. To accept an intended slowdown, label the pull request `perf-regression-accepted`.
+The [Perf A/B workflow](.github/workflows/perf-ab.yml) builds `utf16_len` from the base commit and from the change into one binary, then times them in alternating batches on the same machine, so runner noise affects both sides equally. It repeats this in 7 fresh processes and uses the median, because where the code lands in memory can shift one process's result for short inputs. It runs for pull requests and pushes to `main` on Linux x86_64 and aarch64 and on macOS, and writes the median change per input to the job summary. On Linux, it fails when an input's median is more than 5% slower and every run agrees that it's slower; macOS only reports for now. To accept an intended slowdown, label the pull request `perf-regression-accepted`.
 
 Run the same comparison locally against any ref:
 
