@@ -41,7 +41,7 @@ Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller alr
 
 ## Benchmarks
 
-The [Benchmark workflow](.github/workflows/bench.yml) runs [bench_compare](examples/bench_compare.rs) in release mode on Linux, macOS, and Windows. It compares `utf16_len` with this standard-library baseline, including an ASCII fast path:
+The [Benchmark workflow](.github/workflows/bench.yml), which runs only when started manually, runs [bench_compare](examples/bench_compare.rs) in release mode on Linux, macOS, and Windows. It compares `utf16_len` with this standard-library baseline, including an ASCII fast path:
 
 ```rust
 fn std_guard_len(s: &str) -> usize {
