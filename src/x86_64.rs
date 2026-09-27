@@ -5,15 +5,28 @@
 use std::arch::x86_64::*;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
+///
+/// Not inlined into callers yet: inlining it, and the SSE2 kernel with it,
+/// measured `mixed` and `cjk` 10 to 40% slower on Linux on Zen 3 with the
+/// same instructions, so the kernel's placement decides its speed. The
+/// kernels get restructured first; a later change inlines this.
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
     if start == bytes.len() {
         start
     } else {
-        // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
-        unsafe { utf16_length_sse2(bytes, start) }
+        non_ascii(bytes, start)
     }
+}
+
+/// Counts the bytes after the ASCII prefix. A function of its own, but always
+/// inlined into `utf16_len`, so the machine code stays as it was before the
+/// split.
+#[inline(always)]
+fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
+    unsafe { utf16_length_sse2(bytes, start) }
 }
 
 /// The kernels `utf16_len` can run on this CPU: SSE2, which is baseline.
