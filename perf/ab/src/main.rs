@@ -1,17 +1,22 @@
 //! Times `utf16_len` from two builds of this crate on the same machine.
 //!
-//! `head` is the working tree and `base` is the ref exported by
-//! `scripts/perf-ab.sh`. Both sides alternate in short batches, so runner
-//! noise affects them equally. Each run happens in a fresh process, because
-//! where the two copies of the code land in memory can bias one process by
-//! several percent for some inputs. Each input reports the median of the
-//! runs' median head/base time ratios.
+//! `scripts/perf-ab.sh` builds this harness twice from the same directory:
+//! once against the base ref's crate and once against the working tree's.
+//! The head binary runs the comparison and starts the base binary for the
+//! other side. Every process times one input, and a run times each input's
+//! base and head sides back to back in fresh processes, alternating which
+//! goes first. Separate binaries give identical code identical addresses:
+//! with both sides in one binary, the copy that landed in the worse spot for
+//! the branch predictors measured 10 to 15% slower on some inputs with no
+//! code change. Each input reports the median over the runs of the head/base
+//! time ratio.
 //!
-//! The same rounds also time the standard-library baseline from the README,
-//! for a report-only comparison of head against std.
+//! The head processes also time the standard-library baseline from the
+//! README, for a report-only comparison of head against std.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
@@ -27,17 +32,18 @@ const WARMUP_ROUNDS: usize = 10;
 /// a fraction of a percent on the slower side.
 const SLOWER_RUN_PCT: f64 = 1.0;
 
-const USAGE: &str =
-    "usage: simd-utf16-len-ab [--fail-above <percent>] [--json <path>] [--runs <n>] [--rounds <n>]";
+const USAGE: &str = "usage: simd-utf16-len-ab --base-exe <path> [--fail-above <percent>] [--json <path>] [--runs <n>] [--rounds <n>]";
 
 struct Options {
+    /// The binary built against the base ref; it answers `--child` like this one.
+    base_exe: Option<PathBuf>,
     /// Fail when an input's median time change exceeds this many percent.
     fail_above: Option<f64>,
     json: Option<String>,
     runs: usize,
     rounds: usize,
-    /// Measure once and print raw results for the parent process.
-    child: bool,
+    /// Time this one input and print the raw result for the parent process.
+    child: Option<String>,
 }
 
 /// Median per-call times, head/base time ratio, and std/head speedup of one run.
@@ -49,15 +55,21 @@ struct Run {
     speedup: f64,
 }
 
+/// One process's median per-call times of its own `utf16_len` and of std.
+struct Timing {
+    own_ns: f64,
+    std_ns: f64,
+}
+
 struct Measurement {
     name: &'static str,
     bytes: usize,
     base_ns: f64,
     head_ns: f64,
     std_ns: f64,
-    /// Median head/base time ratio of each run, sorted ascending.
+    /// Head/base time ratio of each run, sorted ascending.
     ratios: Vec<f64>,
-    /// Median std/head time ratio of each run, sorted ascending.
+    /// Std/head time ratio of each run, sorted ascending.
     speedups: Vec<f64>,
 }
 
@@ -98,27 +110,31 @@ fn main() -> ExitCode {
 
     let inputs = inputs::all();
 
-    if options.child {
-        for (name, input) in &inputs {
-            let run = measure(input, options.rounds);
-            println!(
-                "{name}\t{}\t{}\t{}\t{}\t{}",
-                run.base_ns, run.head_ns, run.std_ns, run.ratio, run.speedup
-            );
-        }
+    if let Some(name) = &options.child {
+        let Some((_, input)) = inputs.iter().find(|(known, _)| known == name) else {
+            eprintln!("unknown input: {name}");
+            return ExitCode::from(2);
+        };
+        let timing = measure(input, options.rounds);
+        println!("{name}\t{}\t{}", timing.own_ns, timing.std_ns);
         return ExitCode::SUCCESS;
     }
 
+    let Some(base_exe) = &options.base_exe else {
+        eprintln!("--base-exe is required\n{USAGE}");
+        return ExitCode::from(2);
+    };
+
     // Check head against std rather than base, so fixing a bug in base doesn't fail.
     for (name, input) in &inputs {
-        let (head, expected) = (head::utf16_len(input), std_len(input));
+        let (head, expected) = (simd_utf16_len::utf16_len(input), std_len(input));
         if head != expected {
             eprintln!("{name}: head returned {head} but std counts {expected}");
             return ExitCode::from(2);
         }
     }
 
-    let results = match measure_in_children(&inputs, &options) {
+    let results = match measure_in_children(&inputs, base_exe, &options) {
         Ok(results) => results,
         Err(message) => {
             eprintln!("{message}");
@@ -156,16 +172,18 @@ fn main() -> ExitCode {
 
 fn parse_args() -> Result<Options, String> {
     let mut options = Options {
+        base_exe: None,
         fail_above: None,
         json: None,
         runs: DEFAULT_RUNS,
         rounds: DEFAULT_ROUNDS,
-        child: false,
+        child: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
+            "--base-exe" => options.base_exe = Some(PathBuf::from(value()?)),
             "--fail-above" => {
                 let limit = value()?;
                 options.fail_above = Some(
@@ -177,7 +195,7 @@ fn parse_args() -> Result<Options, String> {
             "--json" => options.json = Some(value()?),
             "--runs" => options.runs = count(value()?)?,
             "--rounds" => options.rounds = count(value()?)?,
-            "--child" => options.child = true,
+            "--child" => options.child = Some(value()?),
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -192,31 +210,39 @@ fn count(value: String) -> Result<usize, String> {
         .ok_or_else(|| format!("invalid count: {value}"))
 }
 
-/// Measures every input in `options.runs` fresh processes and combines the runs.
+/// Times every input `options.runs` times, each side in its own fresh
+/// process, and combines the runs.
 fn measure_in_children(
     inputs: &[(&'static str, String)],
+    base_exe: &Path,
     options: &Options,
 ) -> Result<Vec<Measurement>, String> {
-    let exe = std::env::current_exe().map_err(|error| format!("cannot find myself: {error}"))?;
+    let head_exe =
+        std::env::current_exe().map_err(|error| format!("cannot find myself: {error}"))?;
     let mut runs: Vec<Vec<Run>> = Vec::with_capacity(options.runs);
-    for _ in 0..options.runs {
-        let output = Command::new(&exe)
-            .args(["--child", "--rounds", &options.rounds.to_string()])
-            .output()
-            .map_err(|error| format!("failed to start a run: {error}"))?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let run: Option<Vec<_>> = text
-            .lines()
-            .zip(inputs)
-            .map(|(line, (name, _))| parse_run(line, name))
-            .collect();
-        match run {
-            Some(run) if output.status.success() && run.len() == inputs.len() => runs.push(run),
-            _ => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(format!("a run failed:\n{text}{stderr}"));
-            }
+    for run in 0..options.runs {
+        let mut timings = Vec::with_capacity(inputs.len());
+        for (i, (name, _)) in inputs.iter().enumerate() {
+            // Alternate which side goes first, so drift during a pair can't
+            // favor one side.
+            let base_first = (run + i) % 2 == 0;
+            let (first, second) = if base_first {
+                (base_exe, head_exe.as_path())
+            } else {
+                (head_exe.as_path(), base_exe)
+            };
+            let a = time_in_child(first, name, options.rounds)?;
+            let b = time_in_child(second, name, options.rounds)?;
+            let (base, head) = if base_first { (a, b) } else { (b, a) };
+            timings.push(Run {
+                base_ns: base.own_ns,
+                head_ns: head.own_ns,
+                std_ns: head.std_ns,
+                ratio: head.own_ns / base.own_ns,
+                speedup: head.std_ns / head.own_ns,
+            });
         }
+        runs.push(timings);
     }
 
     Ok(inputs
@@ -241,18 +267,33 @@ fn measure_in_children(
         .collect())
 }
 
-fn parse_run(line: &str, name: &str) -> Option<Run> {
+/// Runs `exe` on one input in a fresh process and reads its timing back.
+fn time_in_child(exe: &Path, name: &str, rounds: usize) -> Result<Timing, String> {
+    let output = Command::new(exe)
+        .args(["--child", name, "--rounds", &rounds.to_string()])
+        .output()
+        .map_err(|error| format!("failed to start {}: {error}", exe.display()))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let timing = if output.status.success() {
+        parse_timing(text.trim_end(), name)
+    } else {
+        None
+    };
+    timing.ok_or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        format!("{} failed on {name}:\n{text}{stderr}", exe.display())
+    })
+}
+
+fn parse_timing(line: &str, name: &str) -> Option<Timing> {
     let mut fields = line.split('\t');
     if fields.next()? != name {
         return None;
     }
     let mut number = || fields.next()?.parse().ok();
-    Some(Run {
-        base_ns: number()?,
-        head_ns: number()?,
+    Some(Timing {
+        own_ns: number()?,
         std_ns: number()?,
-        ratio: number()?,
-        speedup: number()?,
     })
 }
 
@@ -265,63 +306,38 @@ fn std_len(s: &str) -> usize {
     }
 }
 
-fn measure(input: &str, rounds: usize) -> Run {
-    let base = |s: &str| base::utf16_len(s);
-    let head = |s: &str| head::utf16_len(s);
+fn measure(input: &str, rounds: usize) -> Timing {
+    let own = |s: &str| simd_utf16_len::utf16_len(s);
     let standard = |s: &str| std_len(s);
 
-    // Size batches from head and give base the same iteration count. std gets
-    // its own, since it can be 70x slower and would otherwise dominate the time.
-    let iters = calibrate(&head, input);
+    // std gets its own iteration count, since it can be 70x slower and would
+    // otherwise dominate the time.
+    let iters = calibrate(&own, input);
     let std_iters = calibrate(&standard, input);
     for _ in 0..WARMUP_ROUNDS {
-        time_batch(&base, input, iters);
-        time_batch(&head, input, iters);
+        time_batch(&own, input, iters);
         time_batch(&standard, input, std_iters);
     }
 
     let per_call_ns = |d: Duration, iters: u64| d.as_secs_f64() * 1e9 / (2 * iters) as f64;
-    let mut base_ns = Vec::with_capacity(rounds);
-    let mut head_ns = Vec::with_capacity(rounds);
+    let mut own_ns = Vec::with_capacity(rounds);
     let mut std_ns = Vec::with_capacity(rounds);
-    let mut ratios = Vec::with_capacity(rounds);
-    let mut speedups = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        // Base, head, std, std, head, base: every side sits at the same average
-        // position, so drift within a round affects them equally.
-        let b1 = time_batch(&base, input, iters);
-        let h1 = time_batch(&head, input, iters);
+        // Own, std, std, own: both sit at the same average position, so drift
+        // within a round affects them equally.
+        let o1 = time_batch(&own, input, iters);
         let s1 = time_batch(&standard, input, std_iters);
         let s2 = time_batch(&standard, input, std_iters);
-        let h2 = time_batch(&head, input, iters);
-        let b2 = time_batch(&base, input, iters);
-        let (b, h, s) = (
-            per_call_ns(b1 + b2, iters),
-            per_call_ns(h1 + h2, iters),
-            per_call_ns(s1 + s2, std_iters),
-        );
-        ratios.push(h / b);
-        speedups.push(s / h);
-        base_ns.push(b);
-        head_ns.push(h);
-        std_ns.push(s);
+        let o2 = time_batch(&own, input, iters);
+        own_ns.push(per_call_ns(o1 + o2, iters));
+        std_ns.push(per_call_ns(s1 + s2, std_iters));
     }
-    for values in [
-        &mut base_ns,
-        &mut head_ns,
-        &mut std_ns,
-        &mut ratios,
-        &mut speedups,
-    ] {
-        values.sort_by(f64::total_cmp);
-    }
+    own_ns.sort_by(f64::total_cmp);
+    std_ns.sort_by(f64::total_cmp);
 
-    Run {
-        base_ns: percentile(&base_ns, 0.5),
-        head_ns: percentile(&head_ns, 0.5),
+    Timing {
+        own_ns: percentile(&own_ns, 0.5),
         std_ns: percentile(&std_ns, 0.5),
-        ratio: percentile(&ratios, 0.5),
-        speedup: percentile(&speedups, 0.5),
     }
 }
 
@@ -334,7 +350,7 @@ fn calibrate(f: &impl Fn(&str) -> usize, input: &str) -> u64 {
     iters
 }
 
-/// Kept out of line so each side runs its own copy of the loop.
+/// Kept out of line so `utf16_len` and std each run their own copy of the loop.
 #[inline(never)]
 fn time_batch(f: &impl Fn(&str) -> usize, input: &str, iters: u64) -> Duration {
     let start = Instant::now();
@@ -462,7 +478,7 @@ fn markdown(
     .unwrap();
     writeln!(
         out,
-        "{} ({}), {}, {} runs of {} rounds, each in a fresh process. A negative change means head is faster.\n",
+        "{} ({}), {}, {} runs of {} rounds, each side in its own fresh process per input. A negative change means head is faster.\n",
         env.cpu,
         env.features.join(", "),
         env.rustc,
