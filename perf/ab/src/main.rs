@@ -10,10 +10,8 @@ use std::hint::black_box;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-const ASCII: &str = "The quick brown fox jumps over the lazy dog. This is a longer sentence to provide more data for benchmarking purposes, with various words and punctuation marks included.";
-const CJK: &str = "这是一段中文测试文本，用于测试UTF-8编码中多字节字符的处理性能。日本語のテキストも含まれています。한국어 텍스트도 포함되어 있습니다。";
-const EMOJI: &str = "Hello 🌍🌎🌏! Flags: 🇺🇸🇬🇧🇯🇵🇨🇳 Family: 👨\u{200d}👩\u{200d}👧\u{200d}👦 Skin: 👋🏻👋🏼👋🏽👋🏾👋🏿 Fun: 🎉🎊🎈🎁🎄🎃";
-const MIXED: &str = "Hello, 世界! 🌍 Привет мир! こんにちは世界！Héllo wörld! 你好世界！안녕하세요 세계! مرحبا بالعالم";
+#[path = "../../../benches/inputs.rs"]
+mod inputs;
 
 /// Target duration of one timed batch.
 const BATCH: Duration = Duration::from_millis(1);
@@ -55,16 +53,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let inputs = [
-        ("ascii", ASCII.to_owned()),
-        ("cjk", CJK.to_owned()),
-        ("emoji", EMOJI.to_owned()),
-        ("mixed", MIXED.to_owned()),
-        ("ascii_large", ASCII.repeat(64)),
-        ("cjk_large", CJK.repeat(64)),
-        ("emoji_large", EMOJI.repeat(64)),
-        ("mixed_large", MIXED.repeat(64)),
-    ];
+    let inputs = inputs::all();
 
     for (name, input) in &inputs {
         let (base, head) = (base::utf16_len(input), head::utf16_len(input));

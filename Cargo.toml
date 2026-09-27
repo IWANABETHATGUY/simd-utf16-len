@@ -5,6 +5,8 @@ edition = "2024"
 description = "SIMD-accelerated UTF-16 length calculation from UTF-8 strings"
 license = "MIT"
 repository = "https://github.com/SyMind/simd-utf16-len"
+# benches/inputs.rs is a shared module, not a benchmark.
+autobenches = false
 
 [dependencies]
 
