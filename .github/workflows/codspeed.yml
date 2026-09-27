@@ -31,11 +31,11 @@ jobs:
         with:
           channel: "1.98.1"
           cache-target: release
-          bins: cargo-codspeed@4.7.0
+          bins: cargo-codspeed@5.0.2
       - name: Build the benchmark target(s)
         run: cargo codspeed build -m "${{ inputs.mode || 'simulation' }}"
       - name: Run the benchmarks
-        uses: CodSpeedHQ/action@v4
+        uses: CodSpeedHQ/action@v5
         with:
           mode: ${{ inputs.mode || 'simulation' }}
           run: cargo codspeed run
