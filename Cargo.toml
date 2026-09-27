@@ -5,6 +5,8 @@ edition = "2024"
 description = "SIMD-accelerated UTF-16 length calculation from UTF-8 strings"
 license = "MIT"
 repository = "https://github.com/SyMind/simd-utf16-len"
+# benches/inputs.rs is a shared module, not a benchmark.
+autobenches = false
 
 [dependencies]
 
@@ -13,4 +15,8 @@ criterion = { package = "codspeed-criterion-compat", version = "4.7" }
 
 [[bench]]
 name = "utf16_len"
+harness = false
+
+[[bench]]
+name = "code_path"
 harness = false

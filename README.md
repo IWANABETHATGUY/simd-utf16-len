@@ -41,7 +41,7 @@ Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller alr
 
 ## Benchmarks
 
-The [Benchmark workflow](.github/workflows/bench.yml) runs [bench_compare](examples/bench_compare.rs) in release mode on Linux, macOS, and Windows. It compares `utf16_len` with this standard-library baseline, including an ASCII fast path:
+The [Benchmark workflow](.github/workflows/bench.yml), which runs only when started manually, runs [bench_compare](examples/bench_compare.rs) in release mode on Linux, macOS, and Windows. It compares `utf16_len` with this standard-library baseline, including an ASCII fast path:
 
 ```rust
 fn std_guard_len(s: &str) -> usize {
@@ -100,7 +100,7 @@ Use `--release`: a plain `cargo run --example bench_compare` builds unoptimized 
 
 ### Base-vs-PR check
 
-The [Perf A/B workflow](.github/workflows/perf-ab.yml) builds `utf16_len` from the base commit and from the change into one binary, then times them in alternating batches on the same machine, so runner noise affects both sides equally. It runs for pull requests and pushes to `main` on Linux x86_64 and aarch64, and writes the median change per input to the job summary. It fails when an input gets more than 5% slower. To accept an intended slowdown, label the pull request `perf-regression-accepted`.
+The [Perf A/B workflow](.github/workflows/perf-ab.yml) builds `utf16_len` from the base commit and from the change into one binary, then times them in alternating batches on the same machine, so runner noise affects both sides equally. It repeats this in 7 fresh processes and uses the median, because where the code lands in memory can shift one process's result for short inputs. It runs for pull requests and pushes to `main` on Linux x86_64 and aarch64, and writes the median change per input to the job summary. It fails when an input's median is more than 5% slower and every run agrees that it's slower. To accept an intended slowdown, label the pull request `perf-regression-accepted`.
 
 Run the same comparison locally against any ref:
 
@@ -110,7 +110,9 @@ scripts/perf-ab.sh main
 
 ### CodSpeed regression tracking
 
-The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.
+The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its first 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.
+
+The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check and `bench_compare` share.
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 

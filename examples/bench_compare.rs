@@ -2,12 +2,11 @@ use std::hint::black_box;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use inputs::{ASCII, CJK, EMOJI, MIXED};
 use simd_utf16_len::utf16_len;
 
-const ASCII: &str = "The quick brown fox jumps over the lazy dog. This is a longer sentence to provide more data for benchmarking purposes, with various words and punctuation marks included.";
-const CJK: &str = "这是一段中文测试文本，用于测试UTF-8编码中多字节字符的处理性能。日本語のテキストも含まれています。한국어 텍스트도 포함되어 있습니다。";
-const EMOJI: &str = "Hello 🌍🌎🌏! Flags: 🇺🇸🇬🇧🇯🇵🇨🇳 Family: 👨\u{200d}👩\u{200d}👧\u{200d}👦 Skin: 👋🏻👋🏼👋🏽👋🏾👋🏿 Fun: 🎉🎊🎈🎁🎄🎃";
-const MIXED: &str = "Hello, 世界! 🌍 Привет мир! こんにちは世界！Héllo wörld! 你好世界！안녕하세요 세계! مرحبا بالعالم";
+#[path = "../benches/inputs.rs"]
+mod inputs;
 
 const WARMUP_ITERS: u32 = 1_000;
 const BENCH_ITERS: u32 = 10_000;
