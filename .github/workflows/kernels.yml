@@ -1,0 +1,32 @@
+name: Kernel sweep
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: Kernel sweep (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned like Perf A/B, so runs stay comparable.
+        os:
+          - ubuntu-24.04
+          - windows-2025
+          - macos-26
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - name: Time every kernel across input sizes
+        env:
+          # Same function and loop alignment as scripts/perf-ab.sh, so code
+          # placement doesn't bias the results.
+          RUSTFLAGS: -C llvm-args=-align-all-functions=${{ startsWith(matrix.os, 'windows') && '12' || '14' }} -C llvm-args=-align-loops=64
+        run: cargo run --release --quiet --manifest-path perf/kernels/Cargo.toml

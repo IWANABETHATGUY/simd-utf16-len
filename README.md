@@ -98,11 +98,19 @@ scripts/perf-ab.sh main
 
 The separate [CodSpeed workflow](.github/workflows/codspeed.yml) runs the [benchmark suite](benches/utf16_len.rs) in **Simulation** mode by default for pushes, pull requests, and manual runs. Its first 9 cases cover long ASCII (10,816 bytes), CJK, emoji, and mixed text; they compare SIMD with `encode_utf16().count()` and include the ASCII guard for the ASCII input. The long ASCII fixture has a separate benchmark identity from the historical 169-byte fixture, so changing the input size is not reported as a code regression; Unicode benchmark identities remain unchanged.
 
-The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check also uses.
+The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen by the code path they reach: under 16 bytes, under 64 bytes, 3 or 15 bytes left after the last 16-byte vector, text longer than one 4,080-byte batch, and long ASCII with one non-ASCII character at the start or end. The `kernel` group times each kernel the machine supports on the non-ASCII inputs, since ASCII input returns before any kernel runs. All benchmark inputs live in [`benches/inputs.rs`](benches/inputs.rs), which the base-vs-PR check also uses.
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 
-The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback.
+### Kernel sweep
+
+The [Kernel sweep workflow](.github/workflows/kernels.yml) times every kernel a runner supports, and the `utf16_len` dispatch, on non-ASCII inputs from 13 bytes to 16 KiB, to show where a wider kernel starts to pay off. It runs on demand. Locally:
+
+```sh
+cargo run --release --manifest-path perf/kernels/Cargo.toml
+```
+
+The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks.
 
 ## License
 
