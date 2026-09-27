@@ -1,4 +1,4 @@
-//! Benchmark inputs shared by `benches/utf16_len.rs`, `examples/bench_compare.rs`,
+//! Benchmark inputs shared by `benches/utf16_len.rs`, `benches/code_path.rs`,
 //! and `perf/ab`, grouped by the code path they exercise.
 
 // Each includer uses a different subset.

@@ -6,6 +6,9 @@
 //! where the two copies of the code land in memory can bias one process by
 //! several percent for some inputs. Each input reports the median of the
 //! runs' median head/base time ratios.
+//!
+//! The same rounds also time the standard-library baseline from the README,
+//! for a report-only comparison of head against std.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -34,11 +37,13 @@ struct Options {
     child: bool,
 }
 
-/// Median per-call times and head/base time ratio of one run.
+/// Median per-call times, head/base time ratio, and std/head speedup of one run.
 struct Run {
     base_ns: f64,
     head_ns: f64,
+    std_ns: f64,
     ratio: f64,
+    speedup: f64,
 }
 
 struct Measurement {
@@ -46,11 +51,19 @@ struct Measurement {
     bytes: usize,
     base_ns: f64,
     head_ns: f64,
+    std_ns: f64,
     /// Median head/base time ratio of each run, sorted ascending.
     ratios: Vec<f64>,
+    /// Median std/head time ratio of each run, sorted ascending.
+    speedups: Vec<f64>,
 }
 
 impl Measurement {
+    /// How many times faster head is than the standard-library baseline.
+    fn speedup(&self) -> f64 {
+        percentile(&self.speedups, 0.5)
+    }
+
     /// Change in time per call at percentile `p`; negative means head is faster.
     fn change(&self, p: f64) -> f64 {
         percentile(&self.ratios, p) - 1.0
@@ -81,15 +94,19 @@ fn main() -> ExitCode {
     if options.child {
         for (name, input) in &inputs {
             let run = measure(input, options.rounds);
-            println!("{name}\t{}\t{}\t{}", run.base_ns, run.head_ns, run.ratio);
+            println!(
+                "{name}\t{}\t{}\t{}\t{}\t{}",
+                run.base_ns, run.head_ns, run.std_ns, run.ratio, run.speedup
+            );
         }
         return ExitCode::SUCCESS;
     }
 
+    // Check head against std rather than base, so fixing a bug in base doesn't fail.
     for (name, input) in &inputs {
-        let (base, head) = (base::utf16_len(input), head::utf16_len(input));
-        if base != head {
-            eprintln!("{name}: base returned {base} but head returned {head}");
+        let (head, expected) = (head::utf16_len(input), std_len(input));
+        if head != expected {
+            eprintln!("{name}: head returned {head} but std counts {expected}");
             return ExitCode::from(2);
         }
     }
@@ -209,7 +226,9 @@ fn measure_in_children(
                 bytes: input.len(),
                 base_ns: percentile(&sorted(|run| run.base_ns), 0.5),
                 head_ns: percentile(&sorted(|run| run.head_ns), 0.5),
+                std_ns: percentile(&sorted(|run| run.std_ns), 0.5),
                 ratios: sorted(|run| run.ratio),
+                speedups: sorted(|run| run.speedup),
             }
         })
         .collect())
@@ -224,48 +243,88 @@ fn parse_run(line: &str, name: &str) -> Option<Run> {
     Some(Run {
         base_ns: number()?,
         head_ns: number()?,
+        std_ns: number()?,
         ratio: number()?,
+        speedup: number()?,
     })
+}
+
+/// The README's standard-library baseline, which skips counting for ASCII.
+fn std_len(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.encode_utf16().count()
+    }
 }
 
 fn measure(input: &str, rounds: usize) -> Run {
     let base = |s: &str| base::utf16_len(s);
     let head = |s: &str| head::utf16_len(s);
+    let standard = |s: &str| std_len(s);
 
-    // Size batches from head, then give both sides the same iteration count.
-    let mut iters = 1;
-    while time_batch(&head, input, iters) < BATCH {
-        iters *= 2;
-    }
+    // Size batches from head and give base the same iteration count. std gets
+    // its own, since it can be 70x slower and would otherwise dominate the time.
+    let iters = calibrate(&head, input);
+    let std_iters = calibrate(&standard, input);
     for _ in 0..WARMUP_ROUNDS {
         time_batch(&base, input, iters);
         time_batch(&head, input, iters);
+        time_batch(&standard, input, std_iters);
     }
 
-    let per_call_ns = |d: Duration| d.as_secs_f64() * 1e9 / (2 * iters) as f64;
+    let per_call_ns = |d: Duration, iters: u64| d.as_secs_f64() * 1e9 / (2 * iters) as f64;
     let mut base_ns = Vec::with_capacity(rounds);
     let mut head_ns = Vec::with_capacity(rounds);
+    let mut std_ns = Vec::with_capacity(rounds);
     let mut ratios = Vec::with_capacity(rounds);
+    let mut speedups = Vec::with_capacity(rounds);
     for _ in 0..rounds {
-        // Base, head, head, base: drift within a round affects both sides equally.
+        // Base, head, std, std, head, base: every side sits at the same average
+        // position, so drift within a round affects them equally.
         let b1 = time_batch(&base, input, iters);
         let h1 = time_batch(&head, input, iters);
+        let s1 = time_batch(&standard, input, std_iters);
+        let s2 = time_batch(&standard, input, std_iters);
         let h2 = time_batch(&head, input, iters);
         let b2 = time_batch(&base, input, iters);
-        let (b, h) = (b1 + b2, h1 + h2);
-        ratios.push(h.as_secs_f64() / b.as_secs_f64());
-        base_ns.push(per_call_ns(b));
-        head_ns.push(per_call_ns(h));
+        let (b, h, s) = (
+            per_call_ns(b1 + b2, iters),
+            per_call_ns(h1 + h2, iters),
+            per_call_ns(s1 + s2, std_iters),
+        );
+        ratios.push(h / b);
+        speedups.push(s / h);
+        base_ns.push(b);
+        head_ns.push(h);
+        std_ns.push(s);
     }
-    for values in [&mut base_ns, &mut head_ns, &mut ratios] {
+    for values in [
+        &mut base_ns,
+        &mut head_ns,
+        &mut std_ns,
+        &mut ratios,
+        &mut speedups,
+    ] {
         values.sort_by(f64::total_cmp);
     }
 
     Run {
         base_ns: percentile(&base_ns, 0.5),
         head_ns: percentile(&head_ns, 0.5),
+        std_ns: percentile(&std_ns, 0.5),
         ratio: percentile(&ratios, 0.5),
+        speedup: percentile(&speedups, 0.5),
     }
+}
+
+/// The iteration count that makes one batch take at least `BATCH`.
+fn calibrate(f: &impl Fn(&str) -> usize, input: &str) -> u64 {
+    let mut iters = 1;
+    while time_batch(f, input, iters) < BATCH {
+        iters *= 2;
+    }
+    iters
 }
 
 /// Kept out of line so each side runs its own copy of the loop.
@@ -433,6 +492,23 @@ fn markdown(
             .unwrap();
         }
     }
+
+    out.push_str("\n#### Head vs the standard library\n\n");
+    out.push_str("Report only. The baseline returns the length for ASCII input and otherwise uses `encode_utf16().count()`. Above 1x means head is faster.\n\n");
+    out.push_str("| Input | Bytes | Head ns/call | Std ns/call | Speedup |\n");
+    out.push_str("|:------|------:|-------------:|------------:|--------:|\n");
+    for m in results {
+        writeln!(
+            out,
+            "| {} | {} | {:.1} | {:.1} | {:.1}x |",
+            m.name,
+            m.bytes,
+            m.head_ns,
+            m.std_ns,
+            m.speedup(),
+        )
+        .unwrap();
+    }
     out
 }
 
@@ -470,15 +546,17 @@ fn json(
         let separator = if i + 1 < results.len() { "," } else { "" };
         writeln!(
             out,
-            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"change_pct\": {:.2}, \"min_pct\": {:.2}, \"max_pct\": {:.2}, \"slower_runs\": {}}}{separator}",
+            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"std_ns\": {:.3}, \"change_pct\": {:.2}, \"min_pct\": {:.2}, \"max_pct\": {:.2}, \"slower_runs\": {}, \"speedup\": {:.2}}}{separator}",
             quote(m.name),
             m.bytes,
             m.base_ns,
             m.head_ns,
+            m.std_ns,
             m.change(0.5) * 100.0,
             m.change(0.0) * 100.0,
             m.change(1.0) * 100.0,
             m.slower_runs(),
+            m.speedup(),
         )
         .unwrap();
     }
