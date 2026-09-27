@@ -18,51 +18,89 @@ pub fn utf16_len(s: &str) -> usize {
 /// inline the ASCII scan above stay small.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    const LANES: usize = 16;
+    /// A lane of either accumulator gains at most 1 per vector, so this many
+    /// vectors and the tail fit before a sum.
+    const MAX_BATCH: usize = 254;
+
     let len = bytes.len();
-    let mut continuation_count: usize = 0;
-    let mut four_byte_count: usize = 0;
-    let mut i = start;
+    // SAFETY: start <= len is a verified ASCII prefix length, and each
+    // full-vector load stays within the input, the placeholder, or the mask
+    // table.
+    unsafe {
+        let mut sptr = bytes.as_ptr().add(start);
+        let mut nb = len - start;
 
-    let cont_mask = u8x16_splat(0xC0);
-    let cont_val = u8x16_splat(0x80);
-    let four_threshold = u8x16_splat(0xEF);
-    let ones = u8x16_splat(1);
+        let zero = u8x16_splat(0);
+        let cont_mask = u8x16_splat(0xC0);
+        let cont_val = u8x16_splat(0x80);
+        let four_threshold = u8x16_splat(0xEF);
+        let ones = u8x16_splat(1);
 
-    // Process 16 bytes at a time, in batches of up to 255 iterations
-    // to avoid u8 overflow in the per-lane accumulators.
-    while i + 16 <= len {
-        let batch = ((len - i) / 16).min(255);
-        let mut cont_acc = u8x16_splat(0);
-        let mut four_acc = u8x16_splat(0);
-
-        for _ in 0..batch {
-            // SAFETY: i + 16 <= len is guaranteed by the while condition.
-            let chunk = unsafe { v128_load(bytes.as_ptr().add(i) as *const v128) };
-
-            // Continuation bytes: (byte & 0xC0) == 0x80
-            let masked = v128_and(chunk, cont_mask);
-            let is_cont = u8x16_eq(masked, cont_val);
-            // is_cont lanes are 0xFF (-1) for continuation bytes;
-            // subtracting -1 is adding 1.
-            cont_acc = u8x16_sub(cont_acc, is_cont);
-
-            // Four-byte leaders (byte >= 0xF0):
-            // saturating subtract 0xEF gives non-zero only for bytes >= 0xF0,
-            // then clamp to 1 with min.
-            let sub = u8x16_sub_sat(chunk, four_threshold);
-            let is_four = u8x16_min(sub, ones);
-            four_acc = u8x16_add(four_acc, is_four);
-
-            i += 16;
+        macro_rules! load {
+            ($p:expr) => {
+                v128_load($p as *const v128)
+            };
+        }
+        // Every byte contributes one unit, except continuation bytes, which
+        // contribute none, and four-byte leaders, which contribute two: count
+        // both kinds and adjust the byte count at the end.
+        let (mut cont_acc, mut four_acc) = (zero, zero);
+        macro_rules! count {
+            ($v:expr, $keep:expr) => {{
+                let v = $v;
+                // Continuation bytes: (byte & 0xC0) == 0x80, as 0xFF lanes.
+                let is_cont = u8x16_eq(v128_and(v, cont_mask), cont_val);
+                // Four-byte leaders (byte >= 0xF0): saturating subtract 0xEF
+                // gives non-zero only for them, then clamp to 1 with min.
+                let is_four = u8x16_min(u8x16_sub_sat(v, four_threshold), ones);
+                cont_acc = u8x16_sub(cont_acc, $keep(is_cont));
+                four_acc = u8x16_add(four_acc, $keep(is_four));
+            }};
         }
 
-        // Horizontal sum via pairwise widening addition.
-        continuation_count += horizontal_sum_u8(cont_acc);
-        four_byte_count += horizontal_sum_u8(four_acc);
-    }
+        let all = |mask| mask;
+        let (mut continuations, mut fours) = (0, 0);
+        while nb >= LANES * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                count!(load!(sptr), all);
+                sptr = sptr.add(LANES);
+            }
+            nb -= LANES * MAX_BATCH;
+            // More follows: sum now so the lanes can't overflow.
+            continuations += horizontal_sum_u8(cont_acc);
+            fours += horizontal_sum_u8(four_acc);
+            (cont_acc, four_acc) = (zero, zero);
+        }
+        // Fewer than MAX_BATCH vectors remain.
+        while nb >= LANES {
+            count!(load!(sptr), all);
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
+        if nb > 0 {
+            let (v, keep) = if len >= LANES {
+                // The vector that ends at the input's end: only its last nb
+                // lanes are uncounted. Byte-wise counting needs no UTF-8
+                // boundary care.
+                (
+                    load!(bytes.as_ptr().add(len - LANES)),
+                    load!(crate::keep_last(LANES, nb)),
+                )
+            } else {
+                // Copied into a zeroed placeholder, as json-escape-simd does
+                // outside Linux and macOS.
+                let mut placeholder = [0u8; LANES];
+                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
+            };
+            count!(v, |mask| v128_and(mask, keep));
+        }
+        continuations += horizontal_sum_u8(cont_acc);
+        fours += horizontal_sum_u8(four_acc);
 
-    // SAFETY: bytes comes from a valid str, and the SIMD loop maintains i <= len.
-    i - continuation_count + four_byte_count + unsafe { crate::utf16_len_tail(bytes, i) }
+        len - continuations + fours
+    }
 }
 
 /// Horizontal sum of all u8 lanes in a v128 register.

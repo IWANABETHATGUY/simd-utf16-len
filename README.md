@@ -26,7 +26,7 @@ Where:
 - **Continuation bytes** (`(byte & 0xC0) == 0x80`) don't produce UTF-16 code units
 - **Four-byte leaders** (`byte >= 0xF0`) produce surrogate pairs (2 UTF-16 code units instead of 1)
 
-The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted using 16-byte SIMD vectors. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
+The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted using 16-byte SIMD vectors. The last bytes come from an overlapping load of the final vector, masked with a static lane table. Inputs shorter than one vector are read with one full-vector load that stays within their memory page, past their end or, at the end of a page, past their start, in release builds on Linux, macOS, and Windows, instead of copying into a buffer. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
 
 Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller already guarantees or caches that a string is ASCII, `s.len()` remains an O(1) operation and avoids scanning altogether.
 
@@ -110,7 +110,7 @@ The [Kernel sweep workflow](.github/workflows/kernels.yml) times every kernel a 
 cargo run --release --manifest-path perf/kernels/Cargo.toml
 ```
 
-The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks.
+The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks. The tests also run in release builds, where short inputs read past their end instead of being copied.
 
 ## License
 
