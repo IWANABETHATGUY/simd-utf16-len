@@ -87,26 +87,28 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             nb -= LANES;
         }
         if nb > 0 {
-            // Cover the tail with an overlapping load of the last LANES bytes
-            // (only lanes LANES - nb.. are new). When the whole input is
-            // shorter than a vector (only lanes ..nb exist), load past its end
-            // if that stays within the page, else from a zeroed stack
-            // placeholder. Byte-wise counting needs no UTF-8 boundary care:
-            // ignored lanes are simply not counted.
+            // Load the vector that ends at the input's end: only its last nb lanes
+            // are uncounted. Byte-wise counting needs no UTF-8 boundary care. For
+            // inputs shorter than a vector, this starts before the input, and runs
+            // only near the end of a page, where a forward load could fault; the
+            // bytes it reads stay within the pages the input touches. Otherwise
+            // short inputs load forward past their end, within the page, or copy
+            // into a zeroed buffer in debug builds and Miri.
             let index = vld1q_u8(LANE_INDEX.as_ptr());
-            let (v, keep) = if len >= LANES {
-                let v = vld1q_u8(bytes.as_ptr().add(len - LANES));
-                (v, vcgeq_u8(index, vdupq_n_u8((LANES - nb) as u8)))
-            } else {
-                let v = if crate::can_overread(sptr, LANES) {
-                    vld1q_u8(sptr)
+            let (v, keep) =
+                if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
+                    let v = vld1q_u8(bytes.as_ptr().wrapping_add(len).wrapping_sub(LANES));
+                    (v, vcgeq_u8(index, vdupq_n_u8((LANES - nb) as u8)))
                 } else {
-                    let mut placeholder = [0u8; LANES];
-                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                    vld1q_u8(placeholder.as_ptr())
+                    let v = if crate::OVERREAD {
+                        vld1q_u8(sptr)
+                    } else {
+                        let mut placeholder = [0u8; LANES];
+                        std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                        vld1q_u8(placeholder.as_ptr())
+                    };
+                    (v, vcltq_u8(index, vdupq_n_u8(nb as u8)))
                 };
-                (v, vcltq_u8(index, vdupq_n_u8(nb as u8)))
-            };
             acc[1] = vsubq_u8(acc[1], vandq_u8(units!(v), keep));
         }
 

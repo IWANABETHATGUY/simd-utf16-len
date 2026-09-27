@@ -29,23 +29,27 @@ mod wasm32;
 )))]
 mod scalar;
 
-/// Whether a `lanes`-byte load at `ptr` may read past the end of the input:
-/// true when it stays within one 4 KiB page, so it can't fault. This saves
-/// short inputs a copy into a zeroed buffer, as in napi-rs/json-escape-simd,
-/// which allows it on Linux and macOS; Windows pages are 4 KiB as well. Debug
-/// builds and Miri always copy, since they would flag the read.
+/// Whether inputs shorter than one vector may be read with a full-vector load
+/// that reaches outside them, as in napi-rs/json-escape-simd, which allows it
+/// on Linux and macOS; Windows pages are 4 KiB as well. The kernels keep such
+/// loads within the pages the input touches, so they can't fault. Debug builds
+/// and Miri copy into a zeroed buffer instead, since they would flag the read.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const OVERREAD: bool = cfg!(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ),
+    not(debug_assertions),
+    not(miri)
+));
+
+/// Whether a `lanes`-byte load at `ptr` stays within one 4 KiB page.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
-fn can_overread(ptr: *const u8, lanes: usize) -> bool {
-    cfg!(all(
-        any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
-        ),
-        not(debug_assertions),
-        not(miri)
-    )) && (ptr as usize & 4095) + lanes <= 4096
+fn fits_in_page(ptr: *const u8, lanes: usize) -> bool {
+    (ptr as usize & 4095) + lanes <= 4096
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -267,5 +271,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn short_inputs_at_page_edges() {
+        // Short inputs load a whole vector, forward from their start or, near
+        // the end of a page, backward from their end. Surround them with
+        // four-byte leaders, which would change the count if a load counted
+        // bytes outside the input.
+        use std::alloc::{Layout, alloc, dealloc};
+        const PAGE: usize = 4096;
+        let layout = Layout::from_size_align(3 * PAGE, PAGE).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let buf = unsafe { alloc(layout) };
+        assert!(!buf.is_null());
+        // SAFETY: buf points to 3 * PAGE writable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(buf, 3 * PAGE) };
+        bytes.fill(0xF0);
+        let inputs = [
+            "a",
+            "é",
+            "中",
+            "🦀",
+            "héllo wörld",
+            "héllo wörld 中文🦀!",
+            "Привет, мир! 你好",
+        ];
+        for input in inputs {
+            for offset in PAGE - 48..PAGE + 16 {
+                let range = offset..offset + input.len();
+                bytes[range.clone()].copy_from_slice(input.as_bytes());
+                let s = std::str::from_utf8(&bytes[range.clone()]).unwrap();
+                assert_eq!(
+                    utf16_len(s),
+                    reference(input),
+                    "offset: {offset}, input: {input}"
+                );
+                bytes[range].fill(0xF0);
+            }
+        }
+        // SAFETY: buf came from alloc with this layout.
+        unsafe { dealloc(buf, layout) };
     }
 }

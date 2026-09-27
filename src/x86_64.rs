@@ -40,26 +40,37 @@ pub fn utf16_len(s: &str) -> usize {
 /// reducing a wider sum cost more than the wider vectors save.
 const WIDE_MIN: usize = 256;
 
-/// Runs the best kernel after the ASCII prefix. Kept out of line, like
-/// napi-rs/json-escape-simd's dispatch, so the feature checks don't grow the
-/// callers that inline the ASCII scan above.
+/// Runs a kernel after the ASCII prefix. Kept out of line, like
+/// napi-rs/json-escape-simd's dispatch, so callers that inline the ASCII scan
+/// above stay small. Short inputs run the SSE2 kernel inlined here with no
+/// calls, so this path saves no registers; longer ones jump to `wide`.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    if bytes.len() - start >= WIDE_MIN {
+        return wide(bytes, start);
+    }
+    // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
+    // and SSE2 is baseline on x86_64.
+    unsafe { utf16_len_sse2(bytes, start) }
+}
+
+/// Runs the widest kernel this CPU supports.
+#[inline(never)]
+fn wide(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
     // and each kernel only runs when the CPU supports its features.
     unsafe {
-        if bytes.len() - start >= WIDE_MIN {
-            #[cfg(feature = "avx512")]
-            {
-                if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
-                    return utf16_len_avx512(bytes, start);
-                }
-            }
-            if is_x86_feature_detected!("avx2") {
-                return utf16_len_avx2(bytes, start);
+        #[cfg(feature = "avx512")]
+        {
+            if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                return utf16_len_avx512(bytes, start);
             }
         }
-        utf16_len_sse2(bytes, start)
+        if is_x86_feature_detected!("avx2") {
+            utf16_len_avx2(bytes, start)
+        } else {
+            utf16_len_sse2(bytes, start)
+        }
     }
 }
 
@@ -266,22 +277,30 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
         }
         if nb > 0 {
             let index = load!(LANE_INDEX.as_ptr());
-            let (v, keep) = if len >= LANES {
-                // Overlapping load of the last vector: only its last nb lanes
-                // are uncounted. Byte-wise counting needs no UTF-8 boundary care.
-                let v = load!(bytes.as_ptr().add(len - LANES));
-                let keep = _mm256_cmpgt_epi8(index, _mm256_set1_epi8((LANES - nb - 1) as i8));
-                (v, keep)
-            } else {
-                let v = if crate::can_overread(sptr, LANES) {
-                    load!(sptr)
+            let (v, keep) =
+                if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
+                    // Load the vector that ends at the input's end: only its last
+                    // nb lanes are uncounted. Byte-wise counting needs no UTF-8
+                    // boundary care. For inputs shorter than a vector, this starts
+                    // before the input, and runs only near the end of a page,
+                    // where a forward load could fault; the bytes it reads stay
+                    // within the pages the input touches.
+                    let v = load!(bytes.as_ptr().wrapping_add(len).wrapping_sub(LANES));
+                    let keep = _mm256_cmpgt_epi8(index, _mm256_set1_epi8((LANES - nb - 1) as i8));
+                    (v, keep)
                 } else {
-                    let mut placeholder = [0u8; LANES];
-                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                    load!(placeholder.as_ptr())
+                    // Inputs shorter than a vector: load forward past their end,
+                    // within the page, or copy into a zeroed buffer in debug builds
+                    // and Miri.
+                    let v = if crate::OVERREAD {
+                        load!(sptr)
+                    } else {
+                        let mut placeholder = [0u8; LANES];
+                        std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                        load!(placeholder.as_ptr())
+                    };
+                    (v, _mm256_cmpgt_epi8(_mm256_set1_epi8(nb as i8), index))
                 };
-                (v, _mm256_cmpgt_epi8(_mm256_set1_epi8(nb as i8), index))
-            };
             acc[1] = _mm256_sub_epi8(acc[1], _mm256_and_si256(units!(v), keep));
         }
 
@@ -362,22 +381,30 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
         }
         if nb > 0 {
             let index = load!(LANE_INDEX.as_ptr());
-            let (v, keep) = if len >= LANES {
-                // Overlapping load of the last vector: only its last nb lanes
-                // are uncounted. Byte-wise counting needs no UTF-8 boundary care.
-                let v = load!(bytes.as_ptr().add(len - LANES));
-                let keep = _mm_cmpgt_epi8(index, _mm_set1_epi8((LANES - nb - 1) as i8));
-                (v, keep)
-            } else {
-                let v = if crate::can_overread(sptr, LANES) {
-                    load!(sptr)
+            let (v, keep) =
+                if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
+                    // Load the vector that ends at the input's end: only its last
+                    // nb lanes are uncounted. Byte-wise counting needs no UTF-8
+                    // boundary care. For inputs shorter than a vector, this starts
+                    // before the input, and runs only near the end of a page,
+                    // where a forward load could fault; the bytes it reads stay
+                    // within the pages the input touches.
+                    let v = load!(bytes.as_ptr().wrapping_add(len).wrapping_sub(LANES));
+                    let keep = _mm_cmpgt_epi8(index, _mm_set1_epi8((LANES - nb - 1) as i8));
+                    (v, keep)
                 } else {
-                    let mut placeholder = [0u8; LANES];
-                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                    load!(placeholder.as_ptr())
+                    // Inputs shorter than a vector: load forward past their end,
+                    // within the page, or copy into a zeroed buffer in debug builds
+                    // and Miri.
+                    let v = if crate::OVERREAD {
+                        load!(sptr)
+                    } else {
+                        let mut placeholder = [0u8; LANES];
+                        std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                        load!(placeholder.as_ptr())
+                    };
+                    (v, _mm_cmpgt_epi8(_mm_set1_epi8(nb as i8), index))
                 };
-                (v, _mm_cmpgt_epi8(_mm_set1_epi8(nb as i8), index))
-            };
             acc[1] = _mm_sub_epi8(acc[1], _mm_and_si128(units!(v), keep));
         }
 
