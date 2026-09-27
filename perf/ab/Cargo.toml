@@ -5,6 +5,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
-head = { package = "simd-utf16-len", path = "../.." }
-# Exported and renamed by scripts/perf-ab.sh.
-base = { package = "simd-utf16-len-base", path = "../../target/ab-base" }
+# scripts/perf-ab.sh builds this from a copy of the repository, once per side.
+simd-utf16-len = { path = "../.." }
