@@ -14,9 +14,10 @@
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// A lane gains at most 2 per vector, so after this many iterations the four
-/// merged accumulators hold at most 4 * 2 * 30 = 240, which leaves room for
-/// 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
+/// Iterations of four vectors between two sums of the byte-lane
+/// accumulators. A lane gains at most 2 per vector, so the merged
+/// accumulators hold at most 4 * 2 * 30 = 240 after a batch, which leaves
+/// room for 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
 const MAX_BATCH: usize = 30;
 
 /// Below this many bytes after the ASCII prefix, the inlined SSE2 kernel
@@ -234,21 +235,29 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
         // Sums of full batches, as two u64 lanes.
         let mut total = zero;
         let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-        while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(MAX_BATCH);
-            for _ in 0..batch {
+        macro_rules! chunk {
+            () => {
                 a0 = _mm_sub_epi8(a0, neg_units!(load(sptr)));
                 a1 = _mm_sub_epi8(a1, neg_units!(load(sptr.add(LANES))));
                 a2 = _mm_sub_epi8(a2, neg_units!(load(sptr.add(LANES * 2))));
                 a3 = _mm_sub_epi8(a3, neg_units!(load(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
             }
-            nb -= batch * CHUNK;
-            if nb >= CHUNK {
-                // Another batch follows: sum now so the lanes can't overflow.
-                total = _mm_add_epi64(total, _mm_sad_epu8(merge!(a0, a1, a2, a3), zero));
-                (a0, a1, a2, a3) = (zero, zero, zero, zero);
-            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: sum now so the lanes can't overflow.
+            total = _mm_add_epi64(total, _mm_sad_epu8(merge!(a0, a1, a2, a3), zero));
+            (a0, a1, a2, a3) = (zero, zero, zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
         }
         while nb >= LANES {
             a0 = _mm_sub_epi8(a0, neg_units!(load(sptr)));
@@ -298,30 +307,35 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
                 _mm256_shuffle_epi8(table, _mm256_and_si256(_mm256_srli_epi16::<4>($v), nibble))
             };
         }
-        macro_rules! merge {
-            ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
-                _mm256_add_epi8(_mm256_add_epi8($a0, $a1), _mm256_add_epi8($a2, $a3))
+        // Sums of full batches, as four u64 lanes.
+        let mut total = zero;
+        let (mut a0, mut a1) = (zero, zero);
+        // Two accumulators, each taking two of the four vectors per
+        // iteration: the loop is bound by the shuffle port, not by their
+        // dependency chains, and fewer live registers means fewer saves.
+        macro_rules! chunk {
+            () => {
+                a0 = _mm256_add_epi8(a0, units!(load(sptr)));
+                a1 = _mm256_add_epi8(a1, units!(load(sptr.add(LANES))));
+                a0 = _mm256_add_epi8(a0, units!(load(sptr.add(LANES * 2))));
+                a1 = _mm256_add_epi8(a1, units!(load(sptr.add(LANES * 3))));
+                sptr = sptr.add(CHUNK);
             };
         }
 
-        // Sums of full batches, as four u64 lanes.
-        let mut total = zero;
-        let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
+            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: sum now so the lanes can't overflow.
+            total = _mm256_add_epi64(total, _mm256_sad_epu8(_mm256_add_epi8(a0, a1), zero));
+            (a0, a1) = (zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
         while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(MAX_BATCH);
-            for _ in 0..batch {
-                a0 = _mm256_add_epi8(a0, units!(load(sptr)));
-                a1 = _mm256_add_epi8(a1, units!(load(sptr.add(LANES))));
-                a2 = _mm256_add_epi8(a2, units!(load(sptr.add(LANES * 2))));
-                a3 = _mm256_add_epi8(a3, units!(load(sptr.add(LANES * 3))));
-                sptr = sptr.add(CHUNK);
-            }
-            nb -= batch * CHUNK;
-            if nb >= CHUNK {
-                // Another batch follows: sum now so the lanes can't overflow.
-                total = _mm256_add_epi64(total, _mm256_sad_epu8(merge!(a0, a1, a2, a3), zero));
-                (a0, a1, a2, a3) = (zero, zero, zero, zero);
-            }
+            chunk!();
+            nb -= CHUNK;
         }
         while nb >= LANES {
             a0 = _mm256_add_epi8(a0, units!(load(sptr)));
@@ -333,7 +347,7 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
             a1 = _mm256_add_epi8(a1, _mm256_and_si256(units!(v), keep));
         }
 
-        total = _mm256_add_epi64(total, _mm256_sad_epu8(merge!(a0, a1, a2, a3), zero));
+        total = _mm256_add_epi64(total, _mm256_sad_epu8(_mm256_add_epi8(a0, a1), zero));
         let sum = _mm_add_epi64(
             _mm256_castsi256_si128(total),
             _mm256_extracti128_si256::<1>(total),
@@ -375,30 +389,33 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
                 _mm512_shuffle_epi8(table, _mm512_and_si512(_mm512_srli_epi16::<4>($v), nibble))
             };
         }
-        macro_rules! merge {
-            ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
-                _mm512_add_epi8(_mm512_add_epi8($a0, $a1), _mm512_add_epi8($a2, $a3))
+        // Sums of full batches, as eight u64 lanes.
+        let mut total = zero;
+        let (mut a0, mut a1) = (zero, zero);
+        // Two accumulators, as in the AVX2 kernel.
+        macro_rules! chunk {
+            () => {
+                a0 = _mm512_add_epi8(a0, units!(load(sptr)));
+                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES))));
+                a0 = _mm512_add_epi8(a0, units!(load(sptr.add(LANES * 2))));
+                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES * 3))));
+                sptr = sptr.add(CHUNK);
             };
         }
 
-        // Sums of full batches, as eight u64 lanes.
-        let mut total = zero;
-        let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
+            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: sum now so the lanes can't overflow.
+            total = _mm512_add_epi64(total, _mm512_sad_epu8(_mm512_add_epi8(a0, a1), zero));
+            (a0, a1) = (zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
         while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(MAX_BATCH);
-            for _ in 0..batch {
-                a0 = _mm512_add_epi8(a0, units!(load(sptr)));
-                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES))));
-                a2 = _mm512_add_epi8(a2, units!(load(sptr.add(LANES * 2))));
-                a3 = _mm512_add_epi8(a3, units!(load(sptr.add(LANES * 3))));
-                sptr = sptr.add(CHUNK);
-            }
-            nb -= batch * CHUNK;
-            if nb >= CHUNK {
-                // Another batch follows: sum now so the lanes can't overflow.
-                total = _mm512_add_epi64(total, _mm512_sad_epu8(merge!(a0, a1, a2, a3), zero));
-                (a0, a1, a2, a3) = (zero, zero, zero, zero);
-            }
+            chunk!();
+            nb -= CHUNK;
         }
         while nb >= LANES {
             a0 = _mm512_add_epi8(a0, units!(load(sptr)));
@@ -414,7 +431,7 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
             );
         }
 
-        total = _mm512_add_epi64(total, _mm512_sad_epu8(merge!(a0, a1, a2, a3), zero));
+        total = _mm512_add_epi64(total, _mm512_sad_epu8(_mm512_add_epi8(a0, a1), zero));
         start + _mm512_reduce_add_epi64(total) as usize
     }
 }

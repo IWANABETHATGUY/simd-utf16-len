@@ -10,9 +10,10 @@
 
 use std::arch::wasm32::*;
 
-/// A lane gains at most 2 per vector, so after this many iterations the four
-/// merged accumulators hold at most 4 * 2 * 30 = 240, which leaves room for
-/// 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
+/// Iterations of four vectors between two sums of the byte-lane
+/// accumulators. A lane gains at most 2 per vector, so the merged
+/// accumulators hold at most 4 * 2 * 30 = 240 after a batch, which leaves
+/// room for 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
 const MAX_BATCH: usize = 30;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using WASM SIMD128.
@@ -69,21 +70,29 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
         // Sums of full batches, as four u32 lanes.
         let mut total = u32x4_splat(0);
         let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-        while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(MAX_BATCH);
-            for _ in 0..batch {
+        macro_rules! chunk {
+            () => {
                 a0 = u8x16_add(a0, units!(load!(sptr)));
                 a1 = u8x16_add(a1, units!(load!(sptr.add(LANES))));
                 a2 = u8x16_add(a2, units!(load!(sptr.add(LANES * 2))));
                 a3 = u8x16_add(a3, units!(load!(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
             }
-            nb -= batch * CHUNK;
-            if nb >= CHUNK {
-                // Another batch follows: widen now so the lanes can't overflow.
-                total = u32x4_add(total, widen!(merge!(a0, a1, a2, a3)));
-                (a0, a1, a2, a3) = (zero, zero, zero, zero);
-            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: widen now so the lanes can't overflow.
+            total = u32x4_add(total, widen!(merge!(a0, a1, a2, a3)));
+            (a0, a1, a2, a3) = (zero, zero, zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
         }
         while nb >= LANES {
             a0 = u8x16_add(a0, units!(load!(sptr)));

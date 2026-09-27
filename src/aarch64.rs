@@ -10,9 +10,10 @@
 
 use std::arch::aarch64::*;
 
-/// A lane gains at most 2 per vector, so after this many iterations the four
-/// merged accumulators hold at most 4 * 2 * 30 = 240, which leaves room for
-/// 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
+/// Iterations of four vectors between two sums of the byte-lane
+/// accumulators. A lane gains at most 2 per vector, so the merged
+/// accumulators hold at most 4 * 2 * 30 = 240 after a batch, which leaves
+/// room for 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
 const MAX_BATCH: usize = 30;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using NEON.
@@ -62,21 +63,29 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
         // Sums of full batches, widened to u32 lanes without a horizontal add.
         let mut total = vdupq_n_u32(0);
         let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
-        while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(MAX_BATCH);
-            for _ in 0..batch {
+        macro_rules! chunk {
+            () => {
                 a0 = vaddq_u8(a0, units!(vld1q_u8(sptr)));
                 a1 = vaddq_u8(a1, units!(vld1q_u8(sptr.add(LANES))));
                 a2 = vaddq_u8(a2, units!(vld1q_u8(sptr.add(LANES * 2))));
                 a3 = vaddq_u8(a3, units!(vld1q_u8(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
             }
-            nb -= batch * CHUNK;
-            if nb >= CHUNK {
-                // Another batch follows: widen now so the lanes can't overflow.
-                total = vpadalq_u16(total, vpaddlq_u8(merge!(a0, a1, a2, a3)));
-                (a0, a1, a2, a3) = (zero, zero, zero, zero);
-            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: widen now so the lanes can't overflow.
+            total = vpadalq_u16(total, vpaddlq_u8(merge!(a0, a1, a2, a3)));
+            (a0, a1, a2, a3) = (zero, zero, zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
         }
         while nb >= LANES {
             a0 = vaddq_u8(a0, units!(vld1q_u8(sptr)));
