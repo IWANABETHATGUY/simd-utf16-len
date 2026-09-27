@@ -11,10 +11,6 @@ on:
         description: Base ref to compare against (empty means the parent commit, HEAD measures the no-change spread)
         required: false
         default: ""
-      macos:
-        description: Also run on macOS (report only)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -27,7 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         # Pinned so runner image and compiler updates don't show up as performance changes.
-        os: ${{ fromJSON(inputs.macos && '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-26"]' || '["ubuntu-24.04", "ubuntu-24.04-arm"]') }}
+        os:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-26
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,7 +38,8 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           DISPATCH_BASE: ${{ inputs.base }}
           AB_HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-          # macOS runners are too noisy to fail on, and the label accepts an intended slowdown.
+          # macOS only reports until its no-change spread is measured, and the label
+          # accepts an intended slowdown.
           FAIL_ABOVE: ${{ !startsWith(matrix.os, 'macos') && !contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') && '5' || '' }}
         run: |
           case "$EVENT" in
