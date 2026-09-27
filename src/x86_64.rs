@@ -44,52 +44,44 @@ pub fn utf16_len(s: &str) -> usize {
 
 /// Counts the bytes after the ASCII prefix. Out of line, like
 /// json-escape-simd's dispatch, so callers that inline the ASCII scan above
-/// stay small. Short inputs run the SSE2 kernel here with no further call,
-/// and this path calls nothing else, so it saves no registers; longer inputs
-/// tail-call `wide`.
+/// stay small. Short inputs run the SSE2 kernel here with no further call;
+/// longer ones tail-call the widest kernel this CPU supports. Every call
+/// from here is a tail call, so this saves no registers.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
-    if bytes.len() - start >= WIDE_MIN {
-        return wide(bytes, start);
-    }
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
-    // and SSE2 is baseline on x86_64.
-    unsafe { utf16_len_sse2(bytes, start) }
+    // SSE2 is baseline on x86_64, and `detect_then_count` stores a kernel
+    // only after detecting its features, so each wider kernel runs only when
+    // the CPU supports them.
+    unsafe {
+        let nb = bytes.len() - start;
+        if nb >= WIDE_MIN {
+            return match WIDE_KERNEL.load(Ordering::Relaxed) {
+                #[cfg(feature = "avx512")]
+                AVX512 if nb >= AVX512_MIN => utf16_len_avx512(bytes, start),
+                AVX2 | AVX512 => utf16_len_avx2(bytes, start),
+                SSE2 => utf16_len_sse2_long(bytes, start),
+                _ => detect_then_count(bytes, start),
+            };
+        }
+        utf16_len_sse2(bytes, start)
+    }
 }
 
-/// The widest kernel this CPU supports, once `detect_then_wide` has looked:
+/// The widest kernel this CPU supports, once `detect_then_count` has looked:
 /// `SSE2`, `AVX2`, or `AVX512`, and 0 before then. Keeping the selector here
-/// rather than asking `is_x86_feature_detected!` in `wide` keeps the
-/// detection's initialization call, and the registers it would make `wide`
-/// save on every input, in that cold function.
+/// rather than asking `is_x86_feature_detected!` in `non_ascii` keeps the
+/// detection's initialization call, and the registers it would make
+/// `non_ascii` save on every input, in that cold function.
 static WIDE_KERNEL: AtomicU8 = AtomicU8::new(0);
 const SSE2: u8 = 1;
 const AVX2: u8 = 2;
 const AVX512: u8 = 3;
 
-/// Runs the widest kernel this CPU supports on an input of at least
-/// `WIDE_MIN` bytes after the ASCII prefix. Every arm is a tail call, so this
-/// saves no registers.
-#[inline(never)]
-fn wide(bytes: &[u8], start: usize) -> usize {
-    // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
-    // and `detect_then_wide` stores a kernel only after detecting its
-    // features, so each kernel runs only when the CPU supports them.
-    unsafe {
-        match WIDE_KERNEL.load(Ordering::Relaxed) {
-            #[cfg(feature = "avx512")]
-            AVX512 if bytes.len() - start >= AVX512_MIN => utf16_len_avx512(bytes, start),
-            AVX2 | AVX512 => utf16_len_avx2(bytes, start),
-            SSE2 => utf16_len_sse2_long(bytes, start),
-            _ => detect_then_wide(bytes, start),
-        }
-    }
-}
-
-/// Detects the CPU's features once, then runs the kernel they select.
+/// Detects the CPU's features once, then counts with the kernel they select.
 #[cold]
 #[inline(never)]
-fn detect_then_wide(bytes: &[u8], start: usize) -> usize {
+fn detect_then_count(bytes: &[u8], start: usize) -> usize {
     let kernel = if cfg!(feature = "avx512") && is_x86_feature_detected!("avx512bw") {
         AVX512
     } else if is_x86_feature_detected!("avx2") {
@@ -98,11 +90,11 @@ fn detect_then_wide(bytes: &[u8], start: usize) -> usize {
         SSE2
     };
     WIDE_KERNEL.store(kernel, Ordering::Relaxed);
-    wide(bytes, start)
+    non_ascii(bytes, start)
 }
 
 /// The SSE2 kernel out of line, for long inputs on CPUs without AVX2, so
-/// `wide` saves no registers for it.
+/// `non_ascii` saves no registers for it.
 ///
 /// # Safety
 /// `bytes` must be valid UTF-8 with an ASCII prefix of `start` bytes.
