@@ -5,15 +5,23 @@
 use std::arch::x86_64::*;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
     if start == bytes.len() {
         start
     } else {
-        // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
-        unsafe { utf16_length_sse2(bytes, start) }
+        non_ascii(bytes, start)
     }
+}
+
+/// Counts the bytes after the ASCII prefix. Out of line, so callers that
+/// inline the ASCII scan above stay small.
+#[inline(never)]
+fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
+    unsafe { utf16_length_sse2(bytes, start) }
 }
 
 /// The kernels `utf16_len` can run on this CPU: SSE2, which is baseline.

@@ -3,19 +3,25 @@
 use std::arch::wasm32::*;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using WASM SIMD128.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    if len == 0 {
-        return 0;
+    let start = crate::ascii::ascii_prefix_len(bytes);
+    if start == bytes.len() {
+        start
+    } else {
+        non_ascii(bytes, start)
     }
+}
 
+/// Counts the bytes after the ASCII prefix. Out of line, so callers that
+/// inline the ASCII scan above stay small.
+#[inline(never)]
+fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
     let mut continuation_count: usize = 0;
     let mut four_byte_count: usize = 0;
-    let mut i: usize = crate::ascii::ascii_prefix_len(bytes);
-    if i == len {
-        return len;
-    }
+    let mut i = start;
 
     let cont_mask = u8x16_splat(0xC0);
     let cont_val = u8x16_splat(0x80);
