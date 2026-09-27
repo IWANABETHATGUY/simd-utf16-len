@@ -23,6 +23,9 @@ const BATCH: Duration = Duration::from_millis(1);
 const DEFAULT_ROUNDS: usize = 31;
 const DEFAULT_RUNS: usize = 7;
 const WARMUP_ROUNDS: usize = 10;
+/// A run only counts as slower beyond this, since no-change runs can all land
+/// a fraction of a percent on the slower side.
+const SLOWER_RUN_PCT: f64 = 1.0;
 
 const USAGE: &str =
     "usage: simd-utf16-len-ab [--fail-above <percent>] [--json <path>] [--runs <n>] [--rounds <n>]";
@@ -70,11 +73,15 @@ impl Measurement {
     }
 
     fn slower_runs(&self) -> usize {
-        self.ratios.iter().filter(|&&ratio| ratio > 1.0).count()
+        self.ratios
+            .iter()
+            .filter(|&&ratio| (ratio - 1.0) * 100.0 > SLOWER_RUN_PCT)
+            .count()
     }
 
     /// Noisy inputs can put the median past the limit with no code change, but
-    /// their runs then disagree, so a regression must also slow every run.
+    /// their runs then disagree, so a regression must also slow every run by
+    /// more than `SLOWER_RUN_PCT`.
     fn regressed(&self, limit: f64) -> bool {
         self.change(0.5) * 100.0 > limit && self.slower_runs() == self.ratios.len()
     }
@@ -385,7 +392,16 @@ fn cpu_model() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var("PROCESSOR_IDENTIFIER").ok()
+        // PROCESSOR_IDENTIFIER only has the family and model numbers.
+        command_output(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Processor).Name",
+            ],
+        )
+        .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -454,8 +470,8 @@ fn markdown(
         options.rounds,
     )
     .unwrap();
-    out.push_str("| Input | Bytes | Base ns/call | Head ns/call | Time change | Range across runs | Slower runs |\n");
-    out.push_str("|:------|------:|-------------:|-------------:|------------:|------------------:|------------:|\n");
+    out.push_str("| Input | Bytes | Base ns/call | Head ns/call | Time change | Range across runs | Runs >1% slower |\n");
+    out.push_str("|:------|------:|-------------:|-------------:|------------:|------------------:|----------------:|\n");
     for m in results {
         writeln!(
             out,
