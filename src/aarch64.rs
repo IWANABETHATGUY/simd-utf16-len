@@ -2,8 +2,9 @@
 //!
 //! Same structure as the x86_64 kernels from napi-rs/escape-simd: a pointer
 //! cursor, 4 unrolled vectors per iteration with batched u8 accumulators,
-//! then an in-register tail (overlapping last-vector load, or a stack
-//! placeholder for short inputs) instead of a scalar fallback.
+//! then an in-register tail (overlapping last-vector load, or for short
+//! inputs a page-safe over-read or stack placeholder) instead of a scalar
+//! fallback.
 
 use std::arch::aarch64::*;
 
@@ -98,10 +99,11 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
 
         if nb > 0 {
             // Cover the tail with an overlapping load of the last LANES bytes
-            // (only lanes LANES - nb.. are new), or with a zeroed stack
-            // placeholder when the whole input is shorter than a vector
-            // (only lanes ..nb exist). Byte-wise counting needs no UTF-8
-            // boundary care: ignored lanes are simply not counted.
+            // (only lanes LANES - nb.. are new). When the whole input is
+            // shorter than a vector (only lanes ..nb exist), load past its end
+            // if that stays within the page, else from a zeroed stack
+            // placeholder. Byte-wise counting needs no UTF-8 boundary care:
+            // ignored lanes are simply not counted.
             let (v, keep) = if len >= LANES {
                 let v = vld1q_u8(bytes.as_ptr().add(len - LANES));
                 let keep = vcgeq_u8(
@@ -110,9 +112,13 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
                 );
                 (v, keep)
             } else {
-                let mut placeholder = [0u8; LANES];
-                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                let v = vld1q_u8(placeholder.as_ptr());
+                let v = if crate::can_overread(sptr, LANES) {
+                    vld1q_u8(sptr)
+                } else {
+                    let mut placeholder = [0u8; LANES];
+                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                    vld1q_u8(placeholder.as_ptr())
+                };
                 let keep = vcltq_u8(vld1q_u8(LANE_INDEX.as_ptr()), vdupq_n_u8(nb as u8));
                 (v, keep)
             };

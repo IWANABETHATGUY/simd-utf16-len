@@ -26,7 +26,7 @@ Where:
 - **Continuation bytes** (`(byte & 0xC0) == 0x80`) don't produce UTF-16 code units
 - **Four-byte leaders** (`byte >= 0xF0`) produce surrogate pairs (2 UTF-16 code units instead of 1)
 
-The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted with SIMD kernels that process four unrolled vectors per iteration through a pointer cursor, finishing with an in-register tail (an overlapping last-vector load, or a fault-suppressing masked load under AVX-512) instead of a scalar fallback. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
+The SIMD implementations first scan for an ASCII prefix. Entirely ASCII strings return their byte length; otherwise, the verified prefix contributes its byte length and the remaining bytes are counted with SIMD kernels modeled on [napi-rs/json-escape-simd](https://github.com/napi-rs/json-escape-simd): four unrolled vectors per iteration through a pointer cursor, counted into byte-lane accumulators that are summed once per call. The last bytes use an overlapping load of the final vector, or a fault-suppressing masked load under AVX-512. Inputs shorter than one vector load past their end when that stays within the memory page, in release builds on Linux and macOS, instead of copying into a buffer. The ASCII scans follow Rust's standard-library strategy at commit [`4aa1fbc`](https://github.com/rust-lang/rust/blob/4aa1fbcf467cf38ce58abfa8eb9213a789c5381c/library/core/src/slice/ascii.rs): x86_64 uses 64-byte SSE2 blocks, and aarch64 uses 64-byte NEON blocks with a 16-byte vector tail. Both use word-sized checks below 64 bytes. wasm32 uses aligned `usize` loads between unaligned first and last words. The adaptation returns the verified prefix length instead of a boolean; it uses the same block sizes, loads, and tail checks.
 
 Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller already guarantees or caches that a string is ASCII, `s.len()` remains an O(1) operation and avoids scanning altogether.
 
@@ -34,7 +34,7 @@ Call `utf16_len(s)` directly when the ASCII status is unknown. If the caller alr
 
 | Architecture | SIMD | Instruction set |
 |-------------|------|-----------------|
-| x86_64 | AVX-512BW / AVX2 / SSE2 | Runtime dispatch; SSE2 available by default on this architecture |
+| x86_64 | AVX2 / SSE2, or AVX-512BW with the `avx512` feature | Runtime dispatch; SSE2 available by default on this architecture |
 | aarch64 | NEON | Available by default on this architecture |
 | wasm32 | simd128 | Requires `target_feature = "simd128"` |
 | Other | — | Falls back to `encode_utf16().count()` |
@@ -102,7 +102,7 @@ The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 
-The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks. Most runners don't expose AVX-512, so one job runs the tests under Intel's Software Development Emulator as a Sapphire Rapids CPU and fails if any x86_64 kernel is missing.
+The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback. Every test checks each kernel the CPU supports, not only the one `utf16_len` picks. Most runners don't expose AVX-512, so one job runs the tests with the `avx512` feature under Intel's Software Development Emulator as a Sapphire Rapids CPU and fails if any x86_64 kernel is missing. The tests also run in release builds, where short inputs read past their end instead of being copied.
 
 ## License
 

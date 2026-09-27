@@ -1,12 +1,27 @@
 //! x86_64 SIMD UTF-16 length calculation.
 //!
-//! Runtime dispatch (mirroring napi-rs/escape-simd): AVX-512BW -> AVX2 -> SSE2
-//! (baseline on x86_64). Each kernel processes 4 unrolled vectors per
-//! iteration through a pointer cursor, and finishes with an in-register tail
-//! (overlapping last-vector load, or a stack placeholder for short inputs)
-//! instead of a scalar fallback.
+//! Runtime dispatch, as in napi-rs/json-escape-simd: AVX-512BW (only with the
+//! `avx512` feature) -> AVX2 -> SSE2 (baseline on x86_64). Each kernel counts
+//! 4 unrolled vectors per iteration through a pointer cursor into `u8` lane
+//! accumulators, folds leftover vectors and a masked tail vector into the same
+//! accumulators, and reduces them once at the end. Nothing counts bits with
+//! `count_ones`: POPCNT isn't baseline, so it would expand to a long software
+//! sequence.
 
 use std::arch::x86_64::*;
+
+/// Accumulator lanes gain at most 2 per vector (a leader plus a four-byte
+/// leader), so 4 accumulators merged into one stay within `u8` after 30
+/// iterations, with room for 3 leftover vectors and the tail:
+/// 4 * 2 * 30 + 3 * 2 + 2 = 248.
+const MAX_BATCH: usize = 30;
+
+/// Lane indices, compared with the byte count to keep only the tail lanes that
+/// hold uncounted bytes.
+static LANE_INDEX: [u8; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
 #[inline]
@@ -14,13 +29,27 @@ pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
     if start == bytes.len() {
-        return start;
+        start
+    } else {
+        non_ascii(bytes, start)
     }
-    // SAFETY: bytes comes from a valid str, and start is a verified ASCII prefix.
+}
+
+/// Runs the best kernel after the ASCII prefix. Kept out of line, like
+/// napi-rs/json-escape-simd's dispatch, so the feature checks don't grow the
+/// callers that inline the ASCII scan above.
+#[inline(never)]
+fn non_ascii(bytes: &[u8], start: usize) -> usize {
+    // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
+    // and each kernel only runs when the CPU supports its features.
     unsafe {
-        if is_x86_feature_detected!("avx512bw") {
-            utf16_len_avx512(bytes, start)
-        } else if is_x86_feature_detected!("avx2") {
+        #[cfg(feature = "avx512")]
+        {
+            if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                return utf16_len_avx512(bytes, start);
+            }
+        }
+        if is_x86_feature_detected!("avx2") {
             utf16_len_avx2(bytes, start)
         } else {
             utf16_len_sse2(bytes, start)
@@ -28,8 +57,8 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
-/// SSE2, then AVX2 and AVX-512 when this CPU has them, in the order
-/// `utf16_len` prefers them last.
+/// SSE2, then AVX2 and AVX-512 when this CPU has them (AVX-512 only with the
+/// `avx512` feature), in the order `utf16_len` prefers them last.
 pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
     use crate::__kernels::Kernel;
     let mut kernels = vec![Kernel {
@@ -42,11 +71,14 @@ pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
             utf16_len: avx2,
         });
     }
-    if is_x86_feature_detected!("avx512bw") {
-        kernels.push(Kernel {
-            name: "avx512",
-            utf16_len: avx512,
-        });
+    #[cfg(feature = "avx512")]
+    {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            kernels.push(Kernel {
+                name: "avx512",
+                utf16_len: avx512,
+            });
+        }
     }
     kernels
 }
@@ -74,49 +106,16 @@ fn avx2(s: &str) -> usize {
     with_kernel(s, |bytes, start| unsafe { utf16_len_avx2(bytes, start) })
 }
 
+#[cfg(feature = "avx512")]
 fn avx512(s: &str) -> usize {
-    // SAFETY: `kernels` only lists this after detecting AVX-512BW.
+    // SAFETY: `kernels` only lists this after detecting AVX-512BW and VL.
     with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
 }
 
-/// UTF-16 units contributed by the last `nb` bytes of `bytes`, given the
-/// per-lane leader/four-leader bitmasks of the vector holding them.
-///
-/// When `len >= LANES` the tail is covered by an overlapping load of the last
-/// `LANES` bytes, so only lanes `LANES - nb..` are new; otherwise the `nb`
-/// bytes sit in a zeroed stack placeholder and only lanes `..nb` count.
-/// Byte-wise counting needs no UTF-8 boundary care: ignored lanes are simply
-/// not counted, wherever their character starts.
-///
-/// Must be expanded inside an `unsafe` block: the overlapping load stays in
-/// bounds because `len >= LANES`, the placeholder copy reads the `nb < LANES`
-/// bytes remaining at `sptr`, and the placeholder is fully initialized for
-/// `LANES` bytes.
-macro_rules! tail_count {
-    ($bytes:expr, $sptr:expr, $nb:expr, $lanes:expr, $load:expr, $masks:expr) => {{
-        let bytes = $bytes;
-        let nb = $nb;
-        let lanes = $lanes;
-        let (leader_bits, four_bits) = if bytes.len() >= lanes {
-            let v = $load(bytes.as_ptr().add(bytes.len() - lanes));
-            let (leader, four) = $masks(v);
-            let shift = (lanes - nb) as u32;
-            (leader >> shift, four >> shift)
-        } else {
-            let mut placeholder = [0u8; 64];
-            std::ptr::copy_nonoverlapping($sptr, placeholder.as_mut_ptr(), nb);
-            let v = $load(placeholder.as_ptr());
-            let (leader, four) = $masks(v);
-            let keep = (1u64 << nb) - 1;
-            (leader & keep, four & keep)
-        };
-        (leader_bits.count_ones() + four_bits.count_ones()) as usize
-    }};
-}
-
-/// AVX-512BW kernel: byte compares produce 64-bit mask registers directly, so
-/// counting is a plain popcount — no accumulator batching needed.
-#[target_feature(enable = "avx512f,avx512bw")]
+/// AVX-512BW kernel: compares produce mask registers, and masked adds count
+/// them straight into the accumulators.
+#[cfg(feature = "avx512")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 64;
     const CHUNK: usize = LANES * 4;
@@ -125,68 +124,73 @@ unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
         let len = bytes.len();
         let mut sptr = bytes.as_ptr().add(start);
         let mut nb = len - start;
-        let mut count = start;
 
-        let cont_mask = _mm512_set1_epi8(0xC0_u8 as i8);
-        let cont_val = _mm512_set1_epi8(0x80_u8 as i8);
-        let four_val = _mm512_set1_epi8(0xF0_u8 as i8);
+        let zero = _mm512_setzero_si512();
+        let one = _mm512_set1_epi8(1);
+        let cont_max = _mm512_set1_epi8(0xBF_u8 as i8);
+        let four_min = _mm512_set1_epi8(0xF0_u8 as i8);
 
-        // Continuation-byte count of one vector; masked-off lanes load as
-        // zero, which is neither a continuation byte nor a four-byte leader.
-        macro_rules! cont {
-            ($v:expr) => {
-                _mm512_cmpeq_epi8_mask(_mm512_and_si512($v, cont_mask), cont_val).count_ones()
-                    as usize
+        // Adds 1 in each `$keep` lane holding a leader (not a continuation
+        // byte), and 1 more for a four-byte leader.
+        macro_rules! count {
+            ($acc:expr, $v:expr, $keep:expr) => {{
+                let v = $v;
+                let leader = _mm512_cmpgt_epi8_mask(v, cont_max) & $keep;
+                let four = _mm512_cmpge_epu8_mask(v, four_min) & $keep;
+                $acc = _mm512_mask_add_epi8($acc, leader, $acc, one);
+                $acc = _mm512_mask_add_epi8($acc, four, $acc, one);
+            }};
+        }
+        macro_rules! fold {
+            ($acc:expr) => {
+                _mm512_sad_epu8(
+                    _mm512_add_epi8(
+                        _mm512_add_epi8($acc[0], $acc[1]),
+                        _mm512_add_epi8($acc[2], $acc[3]),
+                    ),
+                    zero,
+                )
             };
         }
-        macro_rules! four {
-            ($v:expr) => {
-                _mm512_cmpge_epu8_mask($v, four_val).count_ones() as usize
-            };
-        }
 
-        // 4 independent load+count chains per iteration (256 bytes).
+        let mut total = zero;
+        let mut acc = [zero; 4];
         while nb >= CHUNK {
-            let v1 = _mm512_loadu_si512(sptr as *const __m512i);
-            let v2 = _mm512_loadu_si512(sptr.add(LANES) as *const __m512i);
-            let v3 = _mm512_loadu_si512(sptr.add(LANES * 2) as *const __m512i);
-            let v4 = _mm512_loadu_si512(sptr.add(LANES * 3) as *const __m512i);
-            count += CHUNK - (cont!(v1) + cont!(v2) + cont!(v3) + cont!(v4))
-                + (four!(v1) + four!(v2) + four!(v3) + four!(v4));
-            sptr = sptr.add(CHUNK);
-            nb -= CHUNK;
-        }
-
-        // Up to 3 leftover vectors: accumulate in vector registers and extract
-        // once, instead of paying a kmov+popcnt dependency chain per vector.
-        if nb >= LANES {
-            let zero = _mm512_setzero_si512();
-            let mut cont_acc = zero;
-            let mut four_acc = zero;
-            let mut vectors = 0usize;
-            while nb >= LANES {
-                let v = _mm512_loadu_si512(sptr as *const __m512i);
-                let cont_k = _mm512_cmpeq_epi8_mask(_mm512_and_si512(v, cont_mask), cont_val);
-                let four_k = _mm512_cmpge_epu8_mask(v, four_val);
-                cont_acc = _mm512_sub_epi8(cont_acc, _mm512_movm_epi8(cont_k));
-                four_acc = _mm512_sub_epi8(four_acc, _mm512_movm_epi8(four_k));
-                vectors += 1;
-                sptr = sptr.add(LANES);
-                nb -= LANES;
+            let batch = (nb / CHUNK).min(MAX_BATCH);
+            for _ in 0..batch {
+                for (j, a) in acc.iter_mut().enumerate() {
+                    count!(
+                        *a,
+                        _mm512_loadu_si512(sptr.add(LANES * j) as *const __m512i),
+                        u64::MAX
+                    );
+                }
+                sptr = sptr.add(CHUNK);
             }
-            let cont_sum = _mm512_reduce_add_epi64(_mm512_sad_epu8(cont_acc, zero)) as usize;
-            let four_sum = _mm512_reduce_add_epi64(_mm512_sad_epu8(four_acc, zero)) as usize;
-            count += vectors * LANES - cont_sum + four_sum;
+            nb -= batch * CHUNK;
+            if nb >= CHUNK {
+                // Another batch follows: fold now so the u8 lanes can't overflow.
+                total = _mm512_add_epi64(total, fold!(acc));
+                acc = [zero; 4];
+            }
         }
-
+        while nb >= LANES {
+            count!(acc[0], _mm512_loadu_si512(sptr as *const __m512i), u64::MAX);
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
         if nb > 0 {
-            // Fault-suppressing masked load: no scalar tail, no overread.
-            let k: __mmask64 = (1u64 << nb) - 1;
-            let v = _mm512_maskz_loadu_epi8(k, sptr as *const i8);
-            count += nb - cont!(v) + four!(v);
+            // Fault-suppressing masked load: no copy and no over-read.
+            let keep: __mmask64 = (1u64 << nb) - 1;
+            count!(
+                acc[1],
+                _mm512_maskz_loadu_epi8(keep, sptr as *const i8),
+                keep
+            );
         }
 
-        count
+        total = _mm512_add_epi64(total, fold!(acc));
+        start + _mm512_reduce_add_epi64(total) as usize
     }
 }
 
@@ -199,97 +203,88 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
         let len = bytes.len();
         let mut sptr = bytes.as_ptr().add(start);
         let mut nb = len - start;
-        let mut count = start;
 
+        let zero = _mm256_setzero_si256();
         let cont_max = _mm256_set1_epi8(0xBF_u8 as i8);
         let four_mask = _mm256_set1_epi8(0xF0_u8 as i8);
-        let zero = _mm256_setzero_si256();
 
-        macro_rules! leader {
-            ($v:expr) => {
-                _mm256_cmpgt_epi8($v, cont_max)
+        macro_rules! load {
+            ($p:expr) => {
+                _mm256_loadu_si256($p as *const __m256i)
             };
         }
-        macro_rules! four {
-            ($v:expr) => {
-                _mm256_cmpeq_epi8(_mm256_and_si256($v, four_mask), four_mask)
-            };
-        }
-        macro_rules! leader_bits {
-            ($v:expr) => {
-                _mm256_movemask_epi8(leader!($v)) as u32
-            };
-        }
-        macro_rules! four_bits {
-            ($v:expr) => {
-                _mm256_movemask_epi8(four!($v)) as u32
-            };
-        }
-        // Horizontal byte sum of one accumulator via SAD.
-        macro_rules! sad_sum {
-            ($acc:expr) => {{
-                let sad = _mm256_sad_epu8($acc, zero);
-                (_mm256_extract_epi64::<0>(sad)
-                    + _mm256_extract_epi64::<1>(sad)
-                    + _mm256_extract_epi64::<2>(sad)
-                    + _mm256_extract_epi64::<3>(sad)) as usize
+        // 0, -1, or -2 per lane: -1 for a leader (not a continuation byte),
+        // and -1 more for a four-byte leader. Subtracting it counts units.
+        macro_rules! units {
+            ($v:expr) => {{
+                let v = $v;
+                _mm256_add_epi8(
+                    _mm256_cmpgt_epi8(v, cont_max),
+                    _mm256_cmpeq_epi8(_mm256_and_si256(v, four_mask), four_mask),
+                )
             }};
         }
+        macro_rules! fold {
+            ($acc:expr) => {
+                _mm256_sad_epu8(
+                    _mm256_add_epi8(
+                        _mm256_add_epi8($acc[0], $acc[1]),
+                        _mm256_add_epi8($acc[2], $acc[3]),
+                    ),
+                    zero,
+                )
+            };
+        }
 
-        // u8 lane accumulators overflow after 255 increments; batches are
-        // capped at 63 iterations so each lane stays <= 63 and the 4
-        // accumulators can be merged (<= 252) before one horizontal sum.
+        let mut total = zero;
+        let mut acc = [zero; 4];
         while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(63);
-            let mut leader_acc = [zero; 4];
-            let mut four_acc = [zero; 4];
+            let batch = (nb / CHUNK).min(MAX_BATCH);
             for _ in 0..batch {
-                for (j, acc) in leader_acc.iter_mut().zip(four_acc.iter_mut()).enumerate() {
-                    let v = _mm256_loadu_si256(sptr.add(LANES * j) as *const __m256i);
-                    *acc.0 = _mm256_sub_epi8(*acc.0, leader!(v));
-                    *acc.1 = _mm256_sub_epi8(*acc.1, four!(v));
+                for (j, a) in acc.iter_mut().enumerate() {
+                    *a = _mm256_sub_epi8(*a, units!(load!(sptr.add(LANES * j))));
                 }
                 sptr = sptr.add(CHUNK);
             }
-            let leader_total = _mm256_add_epi8(
-                _mm256_add_epi8(leader_acc[0], leader_acc[1]),
-                _mm256_add_epi8(leader_acc[2], leader_acc[3]),
-            );
-            let four_total = _mm256_add_epi8(
-                _mm256_add_epi8(four_acc[0], four_acc[1]),
-                _mm256_add_epi8(four_acc[2], four_acc[3]),
-            );
-            count += sad_sum!(leader_total) + sad_sum!(four_total);
             nb -= batch * CHUNK;
-        }
-
-        // Up to 3 leftover vectors: accumulate in vector registers and extract
-        // once, instead of paying a movemask+popcnt dependency chain per vector.
-        if nb >= LANES {
-            let mut leader_acc = zero;
-            let mut four_acc = zero;
-            while nb >= LANES {
-                let v = _mm256_loadu_si256(sptr as *const __m256i);
-                leader_acc = _mm256_sub_epi8(leader_acc, leader!(v));
-                four_acc = _mm256_sub_epi8(four_acc, four!(v));
-                sptr = sptr.add(LANES);
-                nb -= LANES;
+            if nb >= CHUNK {
+                // Another batch follows: fold now so the u8 lanes can't overflow.
+                total = _mm256_add_epi64(total, fold!(acc));
+                acc = [zero; 4];
             }
-            count += sad_sum!(leader_acc) + sad_sum!(four_acc);
         }
-
+        while nb >= LANES {
+            acc[0] = _mm256_sub_epi8(acc[0], units!(load!(sptr)));
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
         if nb > 0 {
-            count += tail_count!(
-                bytes,
-                sptr,
-                nb,
-                LANES,
-                |p: *const u8| _mm256_loadu_si256(p as *const __m256i),
-                |v: __m256i| (leader_bits!(v) as u64, four_bits!(v) as u64)
-            );
+            let index = load!(LANE_INDEX.as_ptr());
+            let (v, keep) = if len >= LANES {
+                // Overlapping load of the last vector: only its last nb lanes
+                // are uncounted. Byte-wise counting needs no UTF-8 boundary care.
+                let v = load!(bytes.as_ptr().add(len - LANES));
+                let keep = _mm256_cmpgt_epi8(index, _mm256_set1_epi8((LANES - nb - 1) as i8));
+                (v, keep)
+            } else {
+                let v = if crate::can_overread(sptr, LANES) {
+                    load!(sptr)
+                } else {
+                    let mut placeholder = [0u8; LANES];
+                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                    load!(placeholder.as_ptr())
+                };
+                (v, _mm256_cmpgt_epi8(_mm256_set1_epi8(nb as i8), index))
+            };
+            acc[1] = _mm256_sub_epi8(acc[1], _mm256_and_si256(units!(v), keep));
         }
 
-        count
+        total = _mm256_add_epi64(total, fold!(acc));
+        let sum = _mm_add_epi64(
+            _mm256_castsi256_si128(total),
+            _mm256_extracti128_si256::<1>(total),
+        );
+        start + (_mm_cvtsi128_si64(sum) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(sum, sum))) as usize
     }
 }
 
@@ -302,92 +297,85 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
         let len = bytes.len();
         let mut sptr = bytes.as_ptr().add(start);
         let mut nb = len - start;
-        let mut count = start;
 
+        let zero = _mm_setzero_si128();
         let cont_max = _mm_set1_epi8(0xBF_u8 as i8);
         let four_mask = _mm_set1_epi8(0xF0_u8 as i8);
-        let zero = _mm_setzero_si128();
 
-        macro_rules! leader {
-            ($v:expr) => {
-                _mm_cmpgt_epi8($v, cont_max)
+        macro_rules! load {
+            ($p:expr) => {
+                _mm_loadu_si128($p as *const __m128i)
             };
         }
-        macro_rules! four {
-            ($v:expr) => {
-                _mm_cmpeq_epi8(_mm_and_si128($v, four_mask), four_mask)
-            };
-        }
-        macro_rules! leader_bits {
-            ($v:expr) => {
-                _mm_movemask_epi8(leader!($v)) as u32
-            };
-        }
-        macro_rules! four_bits {
-            ($v:expr) => {
-                _mm_movemask_epi8(four!($v)) as u32
-            };
-        }
-        macro_rules! sad_sum {
-            ($acc:expr) => {{
-                let sad = _mm_sad_epu8($acc, zero);
-                (_mm_cvtsi128_si64(sad) + _mm_cvtsi128_si64(_mm_srli_si128::<8>(sad))) as usize
+        // 0, -1, or -2 per lane: -1 for a leader (not a continuation byte),
+        // and -1 more for a four-byte leader. Subtracting it counts units.
+        macro_rules! units {
+            ($v:expr) => {{
+                let v = $v;
+                _mm_add_epi8(
+                    _mm_cmpgt_epi8(v, cont_max),
+                    _mm_cmpeq_epi8(_mm_and_si128(v, four_mask), four_mask),
+                )
             }};
         }
+        macro_rules! fold {
+            ($acc:expr) => {
+                _mm_sad_epu8(
+                    _mm_add_epi8(
+                        _mm_add_epi8($acc[0], $acc[1]),
+                        _mm_add_epi8($acc[2], $acc[3]),
+                    ),
+                    zero,
+                )
+            };
+        }
 
-        // u8 lane accumulators overflow after 255 increments; batches are
-        // capped at 63 iterations so each lane stays <= 63 and the 4
-        // accumulators can be merged (<= 252) before one horizontal sum.
+        let mut total = zero;
+        let mut acc = [zero; 4];
         while nb >= CHUNK {
-            let batch = (nb / CHUNK).min(63);
-            let mut leader_acc = [zero; 4];
-            let mut four_acc = [zero; 4];
+            let batch = (nb / CHUNK).min(MAX_BATCH);
             for _ in 0..batch {
-                for (j, acc) in leader_acc.iter_mut().zip(four_acc.iter_mut()).enumerate() {
-                    let v = _mm_loadu_si128(sptr.add(LANES * j) as *const __m128i);
-                    *acc.0 = _mm_sub_epi8(*acc.0, leader!(v));
-                    *acc.1 = _mm_sub_epi8(*acc.1, four!(v));
+                for (j, a) in acc.iter_mut().enumerate() {
+                    *a = _mm_sub_epi8(*a, units!(load!(sptr.add(LANES * j))));
                 }
                 sptr = sptr.add(CHUNK);
             }
-            let leader_total = _mm_add_epi8(
-                _mm_add_epi8(leader_acc[0], leader_acc[1]),
-                _mm_add_epi8(leader_acc[2], leader_acc[3]),
-            );
-            let four_total = _mm_add_epi8(
-                _mm_add_epi8(four_acc[0], four_acc[1]),
-                _mm_add_epi8(four_acc[2], four_acc[3]),
-            );
-            count += sad_sum!(leader_total) + sad_sum!(four_total);
             nb -= batch * CHUNK;
-        }
-
-        // Up to 3 leftover vectors: accumulate in vector registers and extract
-        // once, instead of paying a movemask+popcnt dependency chain per vector.
-        if nb >= LANES {
-            let mut leader_acc = zero;
-            let mut four_acc = zero;
-            while nb >= LANES {
-                let v = _mm_loadu_si128(sptr as *const __m128i);
-                leader_acc = _mm_sub_epi8(leader_acc, leader!(v));
-                four_acc = _mm_sub_epi8(four_acc, four!(v));
-                sptr = sptr.add(LANES);
-                nb -= LANES;
+            if nb >= CHUNK {
+                // Another batch follows: fold now so the u8 lanes can't overflow.
+                total = _mm_add_epi64(total, fold!(acc));
+                acc = [zero; 4];
             }
-            count += sad_sum!(leader_acc) + sad_sum!(four_acc);
         }
-
+        while nb >= LANES {
+            acc[0] = _mm_sub_epi8(acc[0], units!(load!(sptr)));
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
         if nb > 0 {
-            count += tail_count!(
-                bytes,
-                sptr,
-                nb,
-                LANES,
-                |p: *const u8| _mm_loadu_si128(p as *const __m128i),
-                |v: __m128i| (leader_bits!(v) as u64, four_bits!(v) as u64)
-            );
+            let index = load!(LANE_INDEX.as_ptr());
+            let (v, keep) = if len >= LANES {
+                // Overlapping load of the last vector: only its last nb lanes
+                // are uncounted. Byte-wise counting needs no UTF-8 boundary care.
+                let v = load!(bytes.as_ptr().add(len - LANES));
+                let keep = _mm_cmpgt_epi8(index, _mm_set1_epi8((LANES - nb - 1) as i8));
+                (v, keep)
+            } else {
+                let v = if crate::can_overread(sptr, LANES) {
+                    load!(sptr)
+                } else {
+                    let mut placeholder = [0u8; LANES];
+                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                    load!(placeholder.as_ptr())
+                };
+                (v, _mm_cmpgt_epi8(_mm_set1_epi8(nb as i8), index))
+            };
+            acc[1] = _mm_sub_epi8(acc[1], _mm_and_si128(units!(v), keep));
         }
 
-        count
+        total = _mm_add_epi64(total, fold!(acc));
+        start
+            + (_mm_cvtsi128_si64(total) + _mm_cvtsi128_si64(_mm_unpackhi_epi64(total, total)))
+                as usize
     }
 }
