@@ -73,8 +73,8 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
                 vaddq_u8(four_acc[0], four_acc[1]),
                 vaddq_u8(four_acc[2], four_acc[3]),
             );
-            count += batch * CHUNK - vaddlvq_u8(cont_total) as usize
-                + vaddlvq_u8(four_total) as usize;
+            count +=
+                batch * CHUNK - vaddlvq_u8(cont_total) as usize + vaddlvq_u8(four_total) as usize;
             nb -= batch * CHUNK;
         }
 
@@ -92,8 +92,8 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
                 sptr = sptr.add(LANES);
                 nb -= LANES;
             }
-            count += vectors * LANES - vaddlvq_u8(cont_acc) as usize
-                + vaddlvq_u8(four_acc) as usize;
+            count +=
+                vectors * LANES - vaddlvq_u8(cont_acc) as usize + vaddlvq_u8(four_acc) as usize;
         }
 
         if nb > 0 {
@@ -104,7 +104,10 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             // boundary care: ignored lanes are simply not counted.
             let (v, keep) = if len >= LANES {
                 let v = vld1q_u8(bytes.as_ptr().add(len - LANES));
-                let keep = vcgeq_u8(vld1q_u8(LANE_INDEX.as_ptr()), vdupq_n_u8((LANES - nb) as u8));
+                let keep = vcgeq_u8(
+                    vld1q_u8(LANE_INDEX.as_ptr()),
+                    vdupq_n_u8((LANES - nb) as u8),
+                );
                 (v, keep)
             } else {
                 let mut placeholder = [0u8; LANES];
