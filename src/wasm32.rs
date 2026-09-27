@@ -1,6 +1,20 @@
 //! WASM SIMD128-based UTF-16 length calculation.
+//!
+//! Shaped like napi-rs/json-escape-simd's kernels: a pointer cursor with a
+//! remaining-byte count, four unrolled vectors per iteration counted into
+//! four byte-lane accumulators, leftover vectors and an in-register tail
+//! folded into the same accumulators, and one horizontal sum. Inputs of
+//! fewer than four vectors skip the accumulators and count into one. Inputs
+//! shorter than a vector are copied into a zeroed placeholder, as
+//! json-escape-simd does outside Linux and macOS.
 
 use std::arch::wasm32::*;
+
+/// Iterations of four vectors between two sums of the byte-lane
+/// accumulators. A lane gains at most 2 per vector, so the merged
+/// accumulators hold at most 4 * 2 * 30 = 240 after a batch, which leaves
+/// room for 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
+const MAX_BATCH: usize = 30;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using WASM SIMD128.
 #[inline]
@@ -14,14 +28,11 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
-/// Counts the bytes after the ASCII prefix. Out of line, so callers that
-/// inline the ASCII scan above stay small.
+/// Out of line, so callers that inline the ASCII scan above stay small.
 #[inline(never)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 16;
-    /// A lane of either accumulator gains at most 1 per vector, so this many
-    /// vectors and the tail fit before a sum.
-    const MAX_BATCH: usize = 254;
+    const CHUNK: usize = LANES * 4;
 
     let len = bytes.len();
     // SAFETY: start <= len is a verified ASCII prefix length, and each
@@ -32,74 +43,111 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
         let mut nb = len - start;
 
         let zero = u8x16_splat(0);
-        let cont_mask = u8x16_splat(0xC0);
-        let cont_val = u8x16_splat(0x80);
-        let four_threshold = u8x16_splat(0xEF);
-        let ones = u8x16_splat(1);
+        let cont_max = i8x16_splat(0xBF_u8 as i8);
+        let four_min = u8x16_splat(0xF0);
 
         macro_rules! load {
             ($p:expr) => {
                 v128_load($p as *const v128)
             };
         }
-        // Every byte contributes one unit, except continuation bytes, which
-        // contribute none, and four-byte leaders, which contribute two: count
-        // both kinds and adjust the byte count at the end.
-        let (mut cont_acc, mut four_acc) = (zero, zero);
-        macro_rules! count {
-            ($v:expr, $keep:expr) => {{
+        // Minus the units each byte contributes: 0xFF (-1) for a leader (any
+        // byte above the continuation range, compared as signed bytes), and
+        // -1 more for a four-byte leader.
+        macro_rules! neg_units {
+            ($v:expr) => {{
                 let v = $v;
-                // Continuation bytes: (byte & 0xC0) == 0x80, as 0xFF lanes.
-                let is_cont = u8x16_eq(v128_and(v, cont_mask), cont_val);
-                // Four-byte leaders (byte >= 0xF0): saturating subtract 0xEF
-                // gives non-zero only for them, then clamp to 1 with min.
-                let is_four = u8x16_min(u8x16_sub_sat(v, four_threshold), ones);
-                cont_acc = u8x16_sub(cont_acc, $keep(is_cont));
-                four_acc = u8x16_add(four_acc, $keep(is_four));
+                i8x16_add(i8x16_gt(v, cont_max), u8x16_ge(v, four_min))
+            }};
+        }
+        // Minus the units of the last nb bytes, from the vector that ends at
+        // the input's end when the input holds a whole vector: only its last
+        // nb lanes are uncounted, and byte-wise counting needs no UTF-8
+        // boundary care. A shorter input is copied into a zeroed placeholder.
+        macro_rules! neg_tail_units {
+            () => {{
+                let (v, keep) = if len >= LANES {
+                    (
+                        load!(bytes.as_ptr().add(len - LANES)),
+                        load!(crate::keep_last(LANES, nb)),
+                    )
+                } else {
+                    let mut placeholder = [0u8; LANES];
+                    std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+                    (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
+                };
+                v128_and(neg_units!(v), keep)
             }};
         }
 
-        let all = |mask| mask;
-        let (mut continuations, mut fours) = (0, 0);
-        while nb >= LANES * MAX_BATCH {
-            for _ in 0..MAX_BATCH {
-                count!(load!(sptr), all);
+        if nb < CHUNK {
+            // Fewer than four vectors: one accumulator, one sum.
+            let mut acc = zero;
+            while nb >= LANES {
+                acc = u8x16_sub(acc, neg_units!(load!(sptr)));
                 sptr = sptr.add(LANES);
+                nb -= LANES;
             }
-            nb -= LANES * MAX_BATCH;
-            // More follows: sum now so the lanes can't overflow.
-            continuations += horizontal_sum_u8(cont_acc);
-            fours += horizontal_sum_u8(four_acc);
-            (cont_acc, four_acc) = (zero, zero);
+            if nb > 0 {
+                acc = u8x16_sub(acc, neg_tail_units!());
+            }
+            return start + horizontal_sum_u8(acc);
         }
-        // Fewer than MAX_BATCH vectors remain.
+
+        macro_rules! merge {
+            ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
+                u8x16_add(u8x16_add($a0, $a1), u8x16_add($a2, $a3))
+            };
+        }
+        // Byte lanes widened to four u32 lanes.
+        macro_rules! widen {
+            ($v:expr) => {
+                u32x4_extadd_pairwise_u16x8(u16x8_extadd_pairwise_u8x16($v))
+            };
+        }
+
+        // Sums of full batches, as four u32 lanes.
+        let mut total = u32x4_splat(0);
+        let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+        macro_rules! chunk {
+            () => {
+                a0 = u8x16_sub(a0, neg_units!(load!(sptr)));
+                a1 = u8x16_sub(a1, neg_units!(load!(sptr.add(LANES))));
+                a2 = u8x16_sub(a2, neg_units!(load!(sptr.add(LANES * 2))));
+                a3 = u8x16_sub(a3, neg_units!(load!(sptr.add(LANES * 3))));
+                sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
+            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: widen now so the lanes can't overflow.
+            total = u32x4_add(total, widen!(merge!(a0, a1, a2, a3)));
+            (a0, a1, a2, a3) = (zero, zero, zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
+        }
         while nb >= LANES {
-            count!(load!(sptr), all);
+            a0 = u8x16_sub(a0, neg_units!(load!(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }
         if nb > 0 {
-            let (v, keep) = if len >= LANES {
-                // The vector that ends at the input's end: only its last nb
-                // lanes are uncounted. Byte-wise counting needs no UTF-8
-                // boundary care.
-                (
-                    load!(bytes.as_ptr().add(len - LANES)),
-                    load!(crate::keep_last(LANES, nb)),
-                )
-            } else {
-                // Copied into a zeroed placeholder, as json-escape-simd does
-                // outside Linux and macOS.
-                let mut placeholder = [0u8; LANES];
-                std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
-                (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
-            };
-            count!(v, |mask| v128_and(mask, keep));
+            a1 = u8x16_sub(a1, neg_tail_units!());
         }
-        continuations += horizontal_sum_u8(cont_acc);
-        fours += horizontal_sum_u8(four_acc);
 
-        len - continuations + fours
+        total = u32x4_add(total, widen!(merge!(a0, a1, a2, a3)));
+        start
+            + (u32x4_extract_lane::<0>(total)
+                + u32x4_extract_lane::<1>(total)
+                + u32x4_extract_lane::<2>(total)
+                + u32x4_extract_lane::<3>(total)) as usize
     }
 }
 
