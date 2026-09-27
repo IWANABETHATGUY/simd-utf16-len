@@ -31,13 +31,18 @@ mod scalar;
 
 /// Whether a `lanes`-byte load at `ptr` may read past the end of the input:
 /// true when it stays within one 4 KiB page, so it can't fault. This saves
-/// short inputs a copy into a zeroed buffer, as in napi-rs/json-escape-simd.
-/// Debug builds and Miri always copy, since they would flag the read.
+/// short inputs a copy into a zeroed buffer, as in napi-rs/json-escape-simd,
+/// which allows it on Linux and macOS; Windows pages are 4 KiB as well. Debug
+/// builds and Miri always copy, since they would flag the read.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn can_overread(ptr: *const u8, lanes: usize) -> bool {
     cfg!(all(
-        any(target_os = "linux", target_os = "macos"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ),
         not(debug_assertions),
         not(miri)
     )) && (ptr as usize & 4095) + lanes <= 4096
@@ -69,7 +74,8 @@ pub mod __kernels {
         pub utf16_len: fn(&str) -> usize,
     }
 
-    /// Every kernel this CPU supports. `utf16_len` runs the last one.
+    /// Every kernel this CPU supports. `utf16_len` runs the last one, except that
+    /// x86_64 keeps SSE2 for inputs shorter than 256 bytes.
     pub fn available() -> Vec<Kernel> {
         #[cfg(target_arch = "x86_64")]
         {

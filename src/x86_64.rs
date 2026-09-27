@@ -35,6 +35,11 @@ pub fn utf16_len(s: &str) -> usize {
     }
 }
 
+/// Below this many bytes after the ASCII prefix, the SSE2 kernel inlined into
+/// `non_ascii` beats calling a wider kernel: the call, the `vzeroupper`, and
+/// reducing a wider sum cost more than the wider vectors save.
+const WIDE_MIN: usize = 256;
+
 /// Runs the best kernel after the ASCII prefix. Kept out of line, like
 /// napi-rs/json-escape-simd's dispatch, so the feature checks don't grow the
 /// callers that inline the ASCII scan above.
@@ -43,22 +48,23 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
     // and each kernel only runs when the CPU supports its features.
     unsafe {
-        #[cfg(feature = "avx512")]
-        {
-            if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
-                return utf16_len_avx512(bytes, start);
+        if bytes.len() - start >= WIDE_MIN {
+            #[cfg(feature = "avx512")]
+            {
+                if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                    return utf16_len_avx512(bytes, start);
+                }
+            }
+            if is_x86_feature_detected!("avx2") {
+                return utf16_len_avx2(bytes, start);
             }
         }
-        if is_x86_feature_detected!("avx2") {
-            utf16_len_avx2(bytes, start)
-        } else {
-            utf16_len_sse2(bytes, start)
-        }
+        utf16_len_sse2(bytes, start)
     }
 }
 
 /// SSE2, then AVX2 and AVX-512 when this CPU has them (AVX-512 only with the
-/// `avx512` feature), in the order `utf16_len` prefers them last.
+/// `avx512` feature). `utf16_len` runs the last one from `WIDE_MIN` bytes on.
 pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
     use crate::__kernels::Kernel;
     let mut kernels = vec![Kernel {
@@ -288,6 +294,8 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
     }
 }
 
+/// `#[inline]` so the dispatch can inline this path for short inputs.
+#[inline]
 #[target_feature(enable = "sse2")]
 unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 16;
