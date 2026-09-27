@@ -37,10 +37,12 @@ export AB_BASE_LABEL AB_HEAD_LABEL
 # share the low address bits that CPU caches and branch predictors index by.
 # With 64-byte alignment, no-change runs still showed short inputs up to 8%
 # slower on one side. Microsoft's linker rejects sections aligned beyond 4 KB.
+# Loops start on a 64-byte boundary too: an unchanged kernel loop measured
+# 5 to 12% slower on Zen 3 after a change elsewhere in its function moved it.
 case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) align_log2=12 ;;
   *) align_log2=14 ;;
 esac
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C llvm-args=-align-all-functions=$align_log2"
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C llvm-args=-align-all-functions=$align_log2 -C llvm-args=-align-loops=64"
 
 cargo run --release --quiet --manifest-path "$root/perf/ab/Cargo.toml" -- "$@"

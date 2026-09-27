@@ -26,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.1
       - name: Time every kernel across input sizes
         env:
-          # Same function alignment as scripts/perf-ab.sh, so code placement
-          # doesn't bias the short inputs.
-          RUSTFLAGS: -C llvm-args=-align-all-functions=${{ startsWith(matrix.os, 'windows') && '12' || '14' }}
+          # Same function and loop alignment as scripts/perf-ab.sh, so code
+          # placement doesn't bias the results.
+          RUSTFLAGS: -C llvm-args=-align-all-functions=${{ startsWith(matrix.os, 'windows') && '12' || '14' }} -C llvm-args=-align-loops=64
         run: cargo run --release --quiet --manifest-path perf/kernels/Cargo.toml
