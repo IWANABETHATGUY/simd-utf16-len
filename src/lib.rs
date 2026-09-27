@@ -67,6 +67,17 @@ mod wasm32;
 )))]
 mod scalar;
 
+/// UTF-16 code units each byte contributes, by its high nibble: ASCII bytes
+/// and two- or three-byte leaders count 1, continuation bytes (`0x80..=0xBF`)
+/// count 0, and four-byte leaders (`0xF0..`) count 2 for their surrogate
+/// pair. The table-lookup kernels shuffle this by the high nibble, the way
+/// json-escape-simd's nibble-table classifier does.
+#[cfg(any(
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+static UNITS_BY_HIGH_NIBBLE: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 2];
+
 /// Lane masks for the last vector: 64 zero bytes, 64 `0xFF` bytes, 64 zero
 /// bytes. `keep_last` and `keep_first` load a window of it, so the tail
 /// needs no runtime broadcast and compare.
