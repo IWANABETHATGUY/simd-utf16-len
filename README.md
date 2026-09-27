@@ -116,7 +116,7 @@ The `code_path` group adds 12 cases that time `utf16_len` alone on inputs chosen
 
 Use the [CodSpeed dashboard](https://app.codspeed.io/SyMind/simd-utf16-len) to track changes across commits and inspect flamegraphs. Simulation results represent modeled execution costs and are distinct from the native timings above. The workflow also supports **Walltime** mode through its manual `mode` input to measure actual elapsed time.
 
-The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness.
+The [CI workflow](.github/workflows/ci.yml) runs `cargo test` on Linux, macOS, and Windows to check correctness. It also runs the unit tests for wasm32 under wasmtime, both with `simd128` and with the scalar fallback.
 
 ## License
 
