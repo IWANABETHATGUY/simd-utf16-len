@@ -16,3 +16,7 @@ criterion = { package = "codspeed-criterion-compat", version = "4.7" }
 [[bench]]
 name = "utf16_len"
 harness = false
+
+[[bench]]
+name = "code_path"
+harness = false

@@ -26,9 +26,10 @@ if ! git -C "$root" diff --quiet HEAD --; then
 fi
 export AB_BASE_LABEL AB_HEAD_LABEL
 
-# Start every function on a 64-byte boundary so identical code gets identical
-# alignment on both sides. Without it, a no-change run showed `emoji` about 8%
-# faster on one side.
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C llvm-args=-align-all-functions=6"
+# Start every function on a 16 KB boundary, so both copies of identical code
+# share the low address bits that CPU caches and branch predictors index by.
+# With 64-byte alignment, no-change runs still showed short inputs up to 8%
+# slower on one side.
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C llvm-args=-align-all-functions=14"
 
 cargo run --release --quiet --manifest-path "$root/perf/ab/Cargo.toml" -- "$@"

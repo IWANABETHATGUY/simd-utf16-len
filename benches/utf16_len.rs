@@ -46,21 +46,5 @@ fn bench_inputs(c: &mut Criterion) {
     group.finish();
 }
 
-// Every other shared input, timing `utf16_len` alone. Inputs benchmarked above
-// keep their original identities there, so CodSpeed history continues.
-fn bench_code_paths(c: &mut Criterion) {
-    let covered = ["cjk", "emoji", "mixed", "ascii_large"];
-    let mut group = c.benchmark_group("code_path");
-    for (name, input) in inputs::all() {
-        if covered.contains(&name) {
-            continue;
-        }
-        group.bench_function(BenchmarkId::new(name, "simd"), |b| {
-            b.iter(|| utf16_len(black_box(input.as_str())));
-        });
-    }
-    group.finish();
-}
-
-criterion_group!(benches, bench_ascii, bench_inputs, bench_code_paths);
+criterion_group!(benches, bench_ascii, bench_inputs);
 criterion_main!(benches);

@@ -1,9 +1,11 @@
-//! Times `utf16_len` from two builds of this crate in one process.
+//! Times `utf16_len` from two builds of this crate on the same machine.
 //!
 //! `head` is the working tree and `base` is the ref exported by
-//! `scripts/perf-ab.sh`. Both sides alternate in short batches on the same
-//! machine, so runner noise affects them equally. Each input reports the
-//! median of its per-round head/base time ratios.
+//! `scripts/perf-ab.sh`. Both sides alternate in short batches, so runner
+//! noise affects them equally. Each run happens in a fresh process, because
+//! where the two copies of the code land in memory can bias one process by
+//! several percent for some inputs. Each input reports the median of the
+//! runs' median head/base time ratios.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -15,17 +17,28 @@ mod inputs;
 
 /// Target duration of one timed batch.
 const BATCH: Duration = Duration::from_millis(1);
-const DEFAULT_ROUNDS: usize = 101;
+const DEFAULT_ROUNDS: usize = 31;
+const DEFAULT_RUNS: usize = 7;
 const WARMUP_ROUNDS: usize = 10;
 
 const USAGE: &str =
-    "usage: simd-utf16-len-ab [--fail-above <percent>] [--json <path>] [--rounds <n>]";
+    "usage: simd-utf16-len-ab [--fail-above <percent>] [--json <path>] [--runs <n>] [--rounds <n>]";
 
 struct Options {
     /// Fail when an input's median time change exceeds this many percent.
     fail_above: Option<f64>,
     json: Option<String>,
+    runs: usize,
     rounds: usize,
+    /// Measure once and print raw results for the parent process.
+    child: bool,
+}
+
+/// Median per-call times and head/base time ratio of one run.
+struct Run {
+    base_ns: f64,
+    head_ns: f64,
+    ratio: f64,
 }
 
 struct Measurement {
@@ -33,7 +46,7 @@ struct Measurement {
     bytes: usize,
     base_ns: f64,
     head_ns: f64,
-    /// Per-round head/base time ratios, sorted ascending.
+    /// Median head/base time ratio of each run, sorted ascending.
     ratios: Vec<f64>,
 }
 
@@ -55,6 +68,14 @@ fn main() -> ExitCode {
 
     let inputs = inputs::all();
 
+    if options.child {
+        for (name, input) in &inputs {
+            let run = measure(input, options.rounds);
+            println!("{name}\t{}\t{}\t{}", run.base_ns, run.head_ns, run.ratio);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     for (name, input) in &inputs {
         let (base, head) = (base::utf16_len(input), head::utf16_len(input));
         if base != head {
@@ -63,10 +84,13 @@ fn main() -> ExitCode {
         }
     }
 
-    let results: Vec<_> = inputs
-        .iter()
-        .map(|(name, input)| measure(name, input, options.rounds))
-        .collect();
+    let results = match measure_in_children(&inputs, &options) {
+        Ok(results) => results,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
     let regressions: Vec<_> = match options.fail_above {
         Some(limit) => results
             .iter()
@@ -100,7 +124,9 @@ fn parse_args() -> Result<Options, String> {
     let mut options = Options {
         fail_above: None,
         json: None,
+        runs: DEFAULT_RUNS,
         rounds: DEFAULT_ROUNDS,
+        child: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -115,21 +141,84 @@ fn parse_args() -> Result<Options, String> {
                 );
             }
             "--json" => options.json = Some(value()?),
-            "--rounds" => {
-                let rounds = value()?;
-                options.rounds = rounds
-                    .parse()
-                    .ok()
-                    .filter(|&n| n > 0)
-                    .ok_or_else(|| format!("invalid round count: {rounds}"))?;
-            }
+            "--runs" => options.runs = count(value()?)?,
+            "--rounds" => options.rounds = count(value()?)?,
+            "--child" => options.child = true,
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
     Ok(options)
 }
 
-fn measure(name: &'static str, input: &str, rounds: usize) -> Measurement {
+fn count(value: String) -> Result<usize, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("invalid count: {value}"))
+}
+
+/// Measures every input in `options.runs` fresh processes and combines the runs.
+fn measure_in_children(
+    inputs: &[(&'static str, String)],
+    options: &Options,
+) -> Result<Vec<Measurement>, String> {
+    let exe = std::env::current_exe().map_err(|error| format!("cannot find myself: {error}"))?;
+    let mut runs: Vec<Vec<Run>> = Vec::with_capacity(options.runs);
+    for _ in 0..options.runs {
+        let output = Command::new(&exe)
+            .args(["--child", "--rounds", &options.rounds.to_string()])
+            .output()
+            .map_err(|error| format!("failed to start a run: {error}"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let run: Option<Vec<_>> = text
+            .lines()
+            .zip(inputs)
+            .map(|(line, (name, _))| parse_run(line, name))
+            .collect();
+        match run {
+            Some(run) if output.status.success() && run.len() == inputs.len() => runs.push(run),
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("a run failed:\n{text}{stderr}"));
+            }
+        }
+    }
+
+    Ok(inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (name, input))| {
+            let sorted = |field: fn(&Run) -> f64| {
+                let mut values: Vec<f64> = runs.iter().map(|run| field(&run[i])).collect();
+                values.sort_by(f64::total_cmp);
+                values
+            };
+            Measurement {
+                name,
+                bytes: input.len(),
+                base_ns: percentile(&sorted(|run| run.base_ns), 0.5),
+                head_ns: percentile(&sorted(|run| run.head_ns), 0.5),
+                ratios: sorted(|run| run.ratio),
+            }
+        })
+        .collect())
+}
+
+fn parse_run(line: &str, name: &str) -> Option<Run> {
+    let mut fields = line.split('\t');
+    if fields.next()? != name {
+        return None;
+    }
+    let mut number = || fields.next()?.parse().ok();
+    Some(Run {
+        base_ns: number()?,
+        head_ns: number()?,
+        ratio: number()?,
+    })
+}
+
+fn measure(input: &str, rounds: usize) -> Run {
     let base = |s: &str| base::utf16_len(s);
     let head = |s: &str| head::utf16_len(s);
 
@@ -162,12 +251,10 @@ fn measure(name: &'static str, input: &str, rounds: usize) -> Measurement {
         values.sort_by(f64::total_cmp);
     }
 
-    Measurement {
-        name,
-        bytes: input.len(),
+    Run {
         base_ns: percentile(&base_ns, 0.5),
         head_ns: percentile(&head_ns, 0.5),
-        ratios,
+        ratio: percentile(&ratios, 0.5),
     }
 }
 
@@ -290,18 +377,19 @@ fn markdown(
     .unwrap();
     writeln!(
         out,
-        "{} ({}), {}, {} rounds. A negative change means head is faster.\n",
+        "{} ({}), {}, {} runs of {} rounds, each in a fresh process. A negative change means head is faster.\n",
         env.cpu,
         env.features.join(", "),
         env.rustc,
+        options.runs,
         options.rounds,
     )
     .unwrap();
     out.push_str(
-        "| Input | Bytes | Base ns/call | Head ns/call | Time change | Middle 50% of rounds |\n",
+        "| Input | Bytes | Base ns/call | Head ns/call | Time change | Range across runs |\n",
     );
     out.push_str(
-        "|:------|------:|-------------:|-------------:|------------:|---------------------:|\n",
+        "|:------|------:|-------------:|-------------:|------------:|------------------:|\n",
     );
     for m in results {
         writeln!(
@@ -312,8 +400,8 @@ fn markdown(
             m.base_ns,
             m.head_ns,
             percent(m.change(0.5)),
-            percent(m.change(0.25)),
-            percent(m.change(0.75)),
+            percent(m.change(0.0)),
+            percent(m.change(1.0)),
         )
         .unwrap();
     }
@@ -353,6 +441,7 @@ fn json(
     writeln!(out, "  \"cpu\": {},", quote(&env.cpu)).unwrap();
     writeln!(out, "  \"features\": [{}],", list(&env.features)).unwrap();
     writeln!(out, "  \"rustc\": {},", quote(&env.rustc)).unwrap();
+    writeln!(out, "  \"runs\": {},", options.runs).unwrap();
     writeln!(out, "  \"rounds\": {},", options.rounds).unwrap();
     match options.fail_above {
         Some(limit) => writeln!(out, "  \"fail_above_pct\": {limit},").unwrap(),
@@ -364,14 +453,14 @@ fn json(
         let separator = if i + 1 < results.len() { "," } else { "" };
         writeln!(
             out,
-            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"change_pct\": {:.2}, \"p25_pct\": {:.2}, \"p75_pct\": {:.2}}}{separator}",
+            "    {{\"name\": {}, \"bytes\": {}, \"base_ns\": {:.3}, \"head_ns\": {:.3}, \"change_pct\": {:.2}, \"min_pct\": {:.2}, \"max_pct\": {:.2}}}{separator}",
             quote(m.name),
             m.bytes,
             m.base_ns,
             m.head_ns,
             m.change(0.5) * 100.0,
-            m.change(0.25) * 100.0,
-            m.change(0.75) * 100.0,
+            m.change(0.0) * 100.0,
+            m.change(1.0) * 100.0,
         )
         .unwrap();
     }
