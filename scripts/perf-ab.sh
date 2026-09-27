@@ -36,9 +36,9 @@ export AB_BASE_LABEL AB_HEAD_LABEL
 # Start every function on a 16 KB boundary, so both copies of identical code
 # share the low address bits that CPU caches and branch predictors index by.
 # With 64-byte alignment, no-change runs still showed short inputs up to 8%
-# slower on one side. Windows object files can't align sections beyond 8 KB.
+# slower on one side. Microsoft's linker rejects sections aligned beyond 4 KB.
 case "$(uname -s)" in
-  MINGW* | MSYS* | CYGWIN*) align_log2=13 ;;
+  MINGW* | MSYS* | CYGWIN*) align_log2=12 ;;
   *) align_log2=14 ;;
 esac
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C llvm-args=-align-all-functions=$align_log2"
