@@ -4,7 +4,10 @@
 //! remaining-byte count, four unrolled vectors per iteration counted into
 //! four byte-lane accumulators, leftover vectors and an in-register tail
 //! folded into the same accumulators, and one horizontal sum. Inputs of
-//! fewer than four vectors skip the accumulators and count into one.
+//! fewer than four vectors skip the accumulators and count into one. Each
+//! byte's units come from a `tbl` lookup of its high nibble, as in
+//! json-escape-simd's nibble-table classifier; NEON shifts bytes directly,
+//! so the index needs no masking.
 
 use std::arch::aarch64::*;
 
@@ -45,22 +48,14 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
         let mut nb = len - start;
 
         let zero = vdupq_n_u8(0);
-        let cont_max = vdupq_n_s8(0xBF_u8 as i8);
-        let four_min = vdupq_n_u8(0xF0);
+        let table = vld1q_u8(crate::UNITS_BY_HIGH_NIBBLE.as_ptr());
 
-        // Minus the units each byte contributes: 0xFF (-1) for a leader (any
-        // byte above the continuation range, compared as signed bytes), and
-        // -1 more for a four-byte leader.
-        macro_rules! neg_units {
-            ($v:expr) => {{
-                let v = $v;
-                vaddq_u8(
-                    vcgtq_s8(vreinterpretq_s8_u8(v), cont_max),
-                    vcgeq_u8(v, four_min),
-                )
-            }};
+        macro_rules! units {
+            ($v:expr) => {
+                vqtbl1q_u8(table, vshrq_n_u8::<4>($v))
+            };
         }
-        // Minus the units of the last nb bytes, from the vector that ends at
+        // The units of the last nb bytes, from the vector that ends at
         // the input's end when the input holds a whole vector: only its last
         // nb lanes are uncounted, and byte-wise counting needs no UTF-8
         // boundary care. A shorter input reads a full vector forward from its
@@ -68,7 +63,7 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
         // at its end, which starts before the input but within the same page,
         // so neither load can fault. Debug builds and Miri copy into a zeroed
         // placeholder instead.
-        macro_rules! neg_tail_units {
+        macro_rules! tail_units {
             () => {{
                 let (v, keep) =
                     if len >= LANES || (crate::OVERREAD && !crate::fits_in_page(sptr, LANES)) {
@@ -86,7 +81,7 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
                             vld1q_u8(crate::keep_first(nb)),
                         )
                     };
-                vandq_u8(neg_units!(v), keep)
+                vandq_u8(units!(v), keep)
             }};
         }
 
@@ -94,12 +89,12 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             // Fewer than four vectors: one accumulator, one sum.
             let mut acc = zero;
             while nb >= LANES {
-                acc = vsubq_u8(acc, neg_units!(vld1q_u8(sptr)));
+                acc = vaddq_u8(acc, units!(vld1q_u8(sptr)));
                 sptr = sptr.add(LANES);
                 nb -= LANES;
             }
             if nb > 0 {
-                acc = vsubq_u8(acc, neg_tail_units!());
+                acc = vaddq_u8(acc, tail_units!());
             }
             return start + vaddlvq_u8(acc) as usize;
         }
@@ -115,10 +110,10 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
         let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
         macro_rules! chunk {
             () => {
-                a0 = vsubq_u8(a0, neg_units!(vld1q_u8(sptr)));
-                a1 = vsubq_u8(a1, neg_units!(vld1q_u8(sptr.add(LANES))));
-                a2 = vsubq_u8(a2, neg_units!(vld1q_u8(sptr.add(LANES * 2))));
-                a3 = vsubq_u8(a3, neg_units!(vld1q_u8(sptr.add(LANES * 3))));
+                a0 = vaddq_u8(a0, units!(vld1q_u8(sptr)));
+                a1 = vaddq_u8(a1, units!(vld1q_u8(sptr.add(LANES))));
+                a2 = vaddq_u8(a2, units!(vld1q_u8(sptr.add(LANES * 2))));
+                a3 = vaddq_u8(a3, units!(vld1q_u8(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
             };
         }
@@ -138,12 +133,12 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
             nb -= CHUNK;
         }
         while nb >= LANES {
-            a0 = vsubq_u8(a0, neg_units!(vld1q_u8(sptr)));
+            a0 = vaddq_u8(a0, units!(vld1q_u8(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }
         if nb > 0 {
-            a1 = vsubq_u8(a1, neg_tail_units!());
+            a1 = vaddq_u8(a1, tail_units!());
         }
 
         start + vaddlvq_u8(merge!(a0, a1, a2, a3)) as usize + vaddvq_u32(total) as usize

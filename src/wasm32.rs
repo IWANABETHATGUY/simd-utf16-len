@@ -4,9 +4,11 @@
 //! remaining-byte count, four unrolled vectors per iteration counted into
 //! four byte-lane accumulators, leftover vectors and an in-register tail
 //! folded into the same accumulators, and one horizontal sum. Inputs of
-//! fewer than four vectors skip the accumulators and count into one. Inputs
-//! shorter than a vector are copied into a zeroed placeholder, as
-//! json-escape-simd does outside Linux and macOS.
+//! fewer than four vectors skip the accumulators and count into one. Each
+//! byte's units come from an `i8x16.swizzle` lookup of its high nibble, as
+//! in json-escape-simd's nibble-table classifier. Inputs shorter than a
+//! vector are copied into a zeroed placeholder, as json-escape-simd does
+//! outside Linux and macOS.
 
 use std::arch::wasm32::*;
 
@@ -43,28 +45,23 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
         let mut nb = len - start;
 
         let zero = u8x16_splat(0);
-        let cont_max = i8x16_splat(0xBF_u8 as i8);
-        let four_min = u8x16_splat(0xF0);
+        let table = v128_load(crate::UNITS_BY_HIGH_NIBBLE.as_ptr() as *const v128);
 
         macro_rules! load {
             ($p:expr) => {
                 v128_load($p as *const v128)
             };
         }
-        // Minus the units each byte contributes: 0xFF (-1) for a leader (any
-        // byte above the continuation range, compared as signed bytes), and
-        // -1 more for a four-byte leader.
-        macro_rules! neg_units {
-            ($v:expr) => {{
-                let v = $v;
-                i8x16_add(i8x16_gt(v, cont_max), u8x16_ge(v, four_min))
-            }};
+        macro_rules! units {
+            ($v:expr) => {
+                i8x16_swizzle(table, u8x16_shr($v, 4))
+            };
         }
-        // Minus the units of the last nb bytes, from the vector that ends at
+        // The units of the last nb bytes, from the vector that ends at
         // the input's end when the input holds a whole vector: only its last
         // nb lanes are uncounted, and byte-wise counting needs no UTF-8
         // boundary care. A shorter input is copied into a zeroed placeholder.
-        macro_rules! neg_tail_units {
+        macro_rules! tail_units {
             () => {{
                 let (v, keep) = if len >= LANES {
                     (
@@ -76,7 +73,7 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
                     std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
                     (load!(placeholder.as_ptr()), load!(crate::keep_first(nb)))
                 };
-                v128_and(neg_units!(v), keep)
+                v128_and(units!(v), keep)
             }};
         }
 
@@ -84,12 +81,12 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
             // Fewer than four vectors: one accumulator, one sum.
             let mut acc = zero;
             while nb >= LANES {
-                acc = u8x16_sub(acc, neg_units!(load!(sptr)));
+                acc = u8x16_add(acc, units!(load!(sptr)));
                 sptr = sptr.add(LANES);
                 nb -= LANES;
             }
             if nb > 0 {
-                acc = u8x16_sub(acc, neg_tail_units!());
+                acc = u8x16_add(acc, tail_units!());
             }
             return start + horizontal_sum_u8(acc);
         }
@@ -111,10 +108,10 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
         let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
         macro_rules! chunk {
             () => {
-                a0 = u8x16_sub(a0, neg_units!(load!(sptr)));
-                a1 = u8x16_sub(a1, neg_units!(load!(sptr.add(LANES))));
-                a2 = u8x16_sub(a2, neg_units!(load!(sptr.add(LANES * 2))));
-                a3 = u8x16_sub(a3, neg_units!(load!(sptr.add(LANES * 3))));
+                a0 = u8x16_add(a0, units!(load!(sptr)));
+                a1 = u8x16_add(a1, units!(load!(sptr.add(LANES))));
+                a2 = u8x16_add(a2, units!(load!(sptr.add(LANES * 2))));
+                a3 = u8x16_add(a3, units!(load!(sptr.add(LANES * 3))));
                 sptr = sptr.add(CHUNK);
             };
         }
@@ -134,12 +131,12 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
             nb -= CHUNK;
         }
         while nb >= LANES {
-            a0 = u8x16_sub(a0, neg_units!(load!(sptr)));
+            a0 = u8x16_add(a0, units!(load!(sptr)));
             sptr = sptr.add(LANES);
             nb -= LANES;
         }
         if nb > 0 {
-            a1 = u8x16_sub(a1, neg_tail_units!());
+            a1 = u8x16_add(a1, tail_units!());
         }
 
         total = u32x4_add(total, widen!(merge!(a0, a1, a2, a3)));
