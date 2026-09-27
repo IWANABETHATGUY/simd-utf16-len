@@ -12,6 +12,7 @@
 //! cleanup, and wider reduction cost more than they save there.
 
 use std::arch::x86_64::*;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// A lane gains at most 2 per vector, so after this many iterations the four
 /// merged accumulators hold at most 4 * 2 * 30 = 240, which leaves room for
@@ -56,26 +57,59 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
     unsafe { utf16_len_sse2(bytes, start) }
 }
 
+/// The widest kernel this CPU supports, once `detect_then_wide` has looked:
+/// `SSE2`, `AVX2`, or `AVX512`, and 0 before then. Keeping the selector here
+/// rather than asking `is_x86_feature_detected!` in `wide` keeps the
+/// detection's initialization call, and the registers it would make `wide`
+/// save on every input, in that cold function.
+static WIDE_KERNEL: AtomicU8 = AtomicU8::new(0);
+const SSE2: u8 = 1;
+const AVX2: u8 = 2;
+const AVX512: u8 = 3;
+
 /// Runs the widest kernel this CPU supports on an input of at least
-/// `WIDE_MIN` bytes after the ASCII prefix.
+/// `WIDE_MIN` bytes after the ASCII prefix. Every arm is a tail call, so this
+/// saves no registers.
 #[inline(never)]
 fn wide(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
-    // SSE2 is baseline on x86_64, and each wider kernel runs only when the
-    // CPU supports its features.
+    // and `detect_then_wide` stores a kernel only after detecting its
+    // features, so each kernel runs only when the CPU supports them.
     unsafe {
-        #[cfg(feature = "avx512")]
-        {
-            if bytes.len() - start >= AVX512_MIN && is_x86_feature_detected!("avx512bw") {
-                return utf16_len_avx512(bytes, start);
-            }
-        }
-        if is_x86_feature_detected!("avx2") {
-            utf16_len_avx2(bytes, start)
-        } else {
-            utf16_len_sse2(bytes, start)
+        match WIDE_KERNEL.load(Ordering::Relaxed) {
+            #[cfg(feature = "avx512")]
+            AVX512 if bytes.len() - start >= AVX512_MIN => utf16_len_avx512(bytes, start),
+            AVX2 | AVX512 => utf16_len_avx2(bytes, start),
+            SSE2 => utf16_len_sse2_long(bytes, start),
+            _ => detect_then_wide(bytes, start),
         }
     }
+}
+
+/// Detects the CPU's features once, then runs the kernel they select.
+#[cold]
+#[inline(never)]
+fn detect_then_wide(bytes: &[u8], start: usize) -> usize {
+    let kernel = if cfg!(feature = "avx512") && is_x86_feature_detected!("avx512bw") {
+        AVX512
+    } else if is_x86_feature_detected!("avx2") {
+        AVX2
+    } else {
+        SSE2
+    };
+    WIDE_KERNEL.store(kernel, Ordering::Relaxed);
+    wide(bytes, start)
+}
+
+/// The SSE2 kernel out of line, for long inputs on CPUs without AVX2, so
+/// `wide` saves no registers for it.
+///
+/// # Safety
+/// `bytes` must be valid UTF-8 with an ASCII prefix of `start` bytes.
+#[inline(never)]
+unsafe fn utf16_len_sse2_long(bytes: &[u8], start: usize) -> usize {
+    // SAFETY: the caller's contract, and SSE2 is baseline on x86_64.
+    unsafe { utf16_len_sse2(bytes, start) }
 }
 
 /// SSE2, then AVX2 and AVX-512 when this CPU has them (AVX-512 only with the
