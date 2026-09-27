@@ -27,12 +27,32 @@ static LANE_INDEX: [u8; 32] = [
 #[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
+    if bytes.len() < 64 {
+        let start = crate::ascii::ascii_prefix_len(bytes);
+        if start == bytes.len() {
+            start
+        } else {
+            non_ascii(bytes, start)
+        }
+    } else {
+        long(bytes)
+    }
+}
+
+/// Experiment: inputs of 64 bytes and more run the block ASCII scan and the
+/// kernel in one out-of-line function, like `main`.
+#[inline(never)]
+fn long(bytes: &[u8]) -> usize {
     let start = crate::ascii::ascii_prefix_len(bytes);
     if start == bytes.len() {
-        start
-    } else {
-        non_ascii(bytes, start)
+        return start;
     }
+    if bytes.len() - start >= WIDE_MIN {
+        return wide(bytes, start);
+    }
+    // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
+    // and SSE2 is baseline on x86_64.
+    unsafe { utf16_len_sse2(bytes, start) }
 }
 
 /// Below this many bytes after the ASCII prefix, the SSE2 kernel inlined into
