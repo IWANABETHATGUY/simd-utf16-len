@@ -33,12 +33,9 @@ const AVX512_MIN: usize = 256;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
 ///
-/// Not inlined into callers yet: inlining it, and the SSE2 kernel with it,
-/// measured `mixed` and `cjk` 10 to 40% slower on Linux on Zen 3 with the
-/// same instructions, so the kernel's placement decides its speed. The
-/// kernels get restructured first; a later change inlines this. The ASCII
-/// scan and its early return are all this function holds; the rest is a
-/// tail call into `non_ascii`.
+/// Inlined into callers, which get the ASCII scan, its early return, and
+/// the dispatch below; only the wider kernels stay calls.
+#[inline]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
@@ -51,10 +48,10 @@ pub fn utf16_len(s: &str) -> usize {
 
 /// Counts the bytes after the ASCII prefix: short inputs run the SSE2 kernel
 /// here, longer ones call the widest kernel this CPU supports, as in
-/// json-escape-simd's dispatch. Always inlined into `utf16_len`, so the call
-/// from there is the only one; every call from here is a tail call, so this
-/// saves no registers.
-#[inline(never)]
+/// json-escape-simd's dispatch. Always inlined, so a caller that inlines
+/// `utf16_len` gets the ASCII scan, this dispatch, and the SSE2 kernel
+/// without a call; only the wider kernels are calls.
+#[inline(always)]
 fn non_ascii(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
     // SSE2 is baseline on x86_64, and `detect_then_count` stores a kernel
