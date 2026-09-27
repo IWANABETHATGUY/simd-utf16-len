@@ -53,28 +53,28 @@ fn std_guard_len(s: &str) -> usize {
 }
 ```
 
-The speedups below are from [run 36311375947](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947) on **2026-09-27**, at commit `ace7793`, using Rust **1.98.1**. Speedup is the baseline's time divided by `utf16_len`'s time, taken as the median of 7 runs in fresh processes, so above 1x means `utf16_len` is faster. The job summaries also list the time per call. The runners were an AMD EPYC 7763 ([x86_64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838579)), a Neoverse-N2 ([aarch64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838670)), and an Apple M1 (Virtual) ([macOS job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36311375947/job/108597838445)).
+The speedups below are from [run 36327863834](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36327863834) on **2026-09-27**, at commit `1d214ee`, using Rust **1.98.1**. Speedup is the baseline's time divided by `utf16_len`'s time, taken as the median of 7 runs in fresh processes, so above 1x means `utf16_len` is faster. The job summaries also list the time per call. The runners were an AMD EPYC 9V74 80-Core Processor ([Linux x86_64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36327863834/job/108643999078)), an AMD EPYC 7763 64-Core Processor ([Windows x86_64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36327863834/job/108643999039)), an Apple M1 (Virtual) ([macOS aarch64 job](https://github.com/IWANABETHATGUY/simd-utf16-len/actions/runs/36327863834/job/108643998878)).
 
-| Input | Bytes | Linux x86_64 | Linux aarch64 | macOS aarch64 |
-|:------|------:|-------------:|--------------:|--------------:|
-| ascii_tiny | 11 | 1.0x | 0.7x | 0.8x |
-| utf8_tiny | 13 | 0.7x | 0.8x | 0.9x |
-| ascii_short | 44 | 0.7x | 0.8x | 0.9x |
-| utf8_short | 53 | 2.7x | 3.0x | 3.1x |
-| ascii | 169 | 6.6x | 1.7x | 2.1x |
-| cjk | 194 | 7.9x | 8.3x | 9.9x |
-| emoji | 170 | 6.4x | 6.1x | 7.4x |
-| mixed | 144 | 9.8x | 6.9x | 11.6x |
-| cjk_tail3 | 195 | 7.4x | 7.5x | 8.0x |
-| cjk_tail15 | 207 | 5.5x | 5.4x | 5.8x |
-| ascii_large | 10816 | 0.7x | 2.1x | 4.1x |
-| cjk_large | 12416 | 15.4x | 12.3x | 13.0x |
-| emoji_large | 10880 | 19.2x | 12.0x | 16.5x |
-| mixed_large | 9216 | 18.0x | 11.5x | 17.5x |
-| early_non_ascii | 10818 | 21.6x | 15.6x | 15.6x |
-| late_non_ascii | 10818 | 40.5x | 35.7x | 49.9x |
+| Input | Bytes | Linux x86_64 | Windows x86_64 | macOS aarch64 |
+|:------|------:|-------------:|---------------:|--------------:|
+| ascii_tiny | 11 | 1.2x | 1.3x | 1.0x |
+| utf8_tiny | 13 | 2.2x | 2.6x | 2.8x |
+| ascii_short | 44 | 1.1x | 1.2x | 1.0x |
+| utf8_short | 53 | 4.8x | 6.3x | 7.0x |
+| ascii | 169 | 7.5x | 6.8x | 2.8x |
+| cjk | 194 | 10.8x | 8.7x | 14.2x |
+| emoji | 170 | 9.5x | 10.3x | 16.6x |
+| mixed | 144 | 10.4x | 9.7x | 19.9x |
+| cjk_tail3 | 195 | 11.9x | 9.4x | 12.9x |
+| cjk_tail15 | 207 | 12.6x | 9.9x | 13.6x |
+| ascii_large | 10816 | 0.9x | 0.9x | 4.1x |
+| cjk_large | 12416 | 42.1x | 33.5x | 24.3x |
+| emoji_large | 10880 | 39.3x | 43.4x | 31.4x |
+| mixed_large | 9216 | 44.0x | 42.0x | 35.8x |
+| early_non_ascii | 10818 | 52.6x | 49.2x | 30.3x |
+| late_non_ascii | 10818 | 54.1x | 51.1x | 51.0x |
 
-The baseline ties or wins on the inputs of 44 bytes or less (`ascii_tiny`, `utf8_tiny`, and `ascii_short`). On x86_64, its `is_ascii` also beats this crate's ASCII scan on the 10,816-byte ASCII input. Results depend on input length, character distribution, CPU, and compiler, so these ratios don't promise a speedup for every string or platform.
+The baseline stays within 30% of `utf16_len` on the ASCII inputs of 44 bytes or less (`ascii_tiny` and `ascii_short`), and on x86_64 its `is_ascii` beats this crate's ASCII scan on the 10,816-byte ASCII input. Results depend on input length, character distribution, CPU, and compiler, so these ratios don't promise a speedup for every string or platform.
 
 ### Reproduce locally
 
