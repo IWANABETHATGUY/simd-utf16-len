@@ -1,15 +1,15 @@
 //! x86_64 SIMD UTF-16 length calculation.
 //!
-//! Runtime dispatch, as in napi-rs/json-escape-simd: AVX2 -> SSE2, which is
-//! baseline on x86_64. Both kernels walk a pointer cursor with a
-//! remaining-byte count, fold the tail into the same byte-lane accumulators
-//! as the full vectors, and sum them once with `psadbw`. AVX2 counts four
-//! unrolled vectors per iteration and looks up each byte's units by its high
-//! nibble with `pshufb`; SSE2 has no byte shuffle, so it compares, one vector
-//! per iteration. Inputs with fewer than `WIDE_MIN` bytes after their ASCII
-//! prefix stay on the SSE2 kernel inlined into the dispatch: the AVX2
-//! kernel's call, upper-register cleanup, and wider reduction cost more than
-//! they save there.
+//! Runtime dispatch, as in napi-rs/json-escape-simd: AVX-512BW (only with the
+//! `avx512` feature) -> AVX2 -> SSE2, which is baseline on x86_64. Every
+//! kernel walks a pointer cursor with a remaining-byte count, folds the tail
+//! into the same byte-lane accumulators as the full vectors, and sums them
+//! once with `psadbw`. AVX2 and AVX-512 count four unrolled vectors per
+//! iteration and look up each byte's units by its high nibble with `pshufb`;
+//! SSE2 has no byte shuffle, so it compares, one vector per iteration. Inputs
+//! with fewer than `WIDE_MIN` bytes after their ASCII prefix stay on the SSE2
+//! kernel inlined into the dispatch: a wider kernel's call, upper-register
+//! cleanup, and wider reduction cost more than they save there.
 
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -24,6 +24,12 @@ const MAX_BATCH: usize = 30;
 /// beats calling the AVX2 kernel, as measured by the kernel sweep on Zen 3,
 /// Zen 4, and Granite Rapids.
 const WIDE_MIN: usize = 64;
+
+/// Below this many bytes after the ASCII prefix, the AVX2 kernel beats the
+/// AVX-512 kernel, whose 64-byte vectors and wider reduction only pay off
+/// on longer inputs.
+#[cfg(feature = "avx512")]
+const AVX512_MIN: usize = 256;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
 ///
@@ -58,7 +64,9 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
         let nb = bytes.len() - start;
         if nb >= WIDE_MIN {
             return match WIDE_KERNEL.load(Ordering::Relaxed) {
-                AVX2 => utf16_len_avx2(bytes, start),
+                #[cfg(feature = "avx512")]
+                AVX512 if nb >= AVX512_MIN => utf16_len_avx512(bytes, start),
+                AVX2 | AVX512 => utf16_len_avx2(bytes, start),
                 SSE2 => utf16_len_sse2_long(bytes, start),
                 _ => detect_then_count(bytes, start),
             };
@@ -68,19 +76,22 @@ fn non_ascii(bytes: &[u8], start: usize) -> usize {
 }
 
 /// The widest kernel this CPU supports, once `detect_then_count` has looked:
-/// `SSE2` or `AVX2`, and 0 before then. Keeping the selector here rather than
+/// `SSE2`, `AVX2`, or `AVX512`, and 0 before then. Keeping the selector here rather than
 /// asking `is_x86_feature_detected!` in `non_ascii` keeps the detection's
 /// initialization call, and the registers it would make `non_ascii` save on
 /// every input, in that cold function.
 static WIDE_KERNEL: AtomicU8 = AtomicU8::new(0);
 const SSE2: u8 = 1;
 const AVX2: u8 = 2;
+const AVX512: u8 = 3;
 
 /// Detects the CPU's features once, then counts with the kernel they select.
 #[cold]
 #[inline(never)]
 fn detect_then_count(bytes: &[u8], start: usize) -> usize {
-    let kernel = if is_x86_feature_detected!("avx2") {
+    let kernel = if cfg!(feature = "avx512") && is_x86_feature_detected!("avx512bw") {
+        AVX512
+    } else if is_x86_feature_detected!("avx2") {
         AVX2
     } else {
         SSE2
@@ -100,8 +111,8 @@ unsafe fn utf16_len_sse2_long(bytes: &[u8], start: usize) -> usize {
     unsafe { utf16_len_sse2(bytes, start) }
 }
 
-/// SSE2, then AVX2 when this CPU has it, in the order `utf16_len` prefers
-/// them for long inputs.
+/// SSE2, then AVX2 and AVX-512 when this CPU has them (AVX-512 only with the
+/// `avx512` feature), in the order `utf16_len` prefers them for long inputs.
 pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
     use crate::__kernels::Kernel;
     let mut kernels = vec![Kernel {
@@ -113,6 +124,15 @@ pub(crate) fn kernels() -> Vec<crate::__kernels::Kernel> {
             name: "avx2",
             utf16_len: avx2,
         });
+    }
+    #[cfg(feature = "avx512")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            kernels.push(Kernel {
+                name: "avx512",
+                utf16_len: avx512,
+            });
+        }
     }
     kernels
 }
@@ -138,6 +158,12 @@ fn sse2(s: &str) -> usize {
 fn avx2(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX2.
     with_kernel(s, |bytes, start| unsafe { utf16_len_avx2(bytes, start) })
+}
+
+#[cfg(feature = "avx512")]
+fn avx512(s: &str) -> usize {
+    // SAFETY: `kernels` only lists this after detecting AVX-512BW.
+    with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
 }
 
 /// SSE2 kernel, `#[inline(always)]` so short inputs run it inside `non_ascii`
@@ -317,5 +343,84 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
         );
         let sum = _mm_add_epi64(sum, _mm_srli_si128::<8>(sum));
         start + _mm_cvtsi128_si64(sum) as usize
+    }
+}
+
+/// AVX-512BW kernel: the same lookup on 64-byte vectors, and a masked load
+/// for the tail, which suppresses faults on the masked-off lanes, so it needs
+/// neither a copy nor an over-read.
+///
+/// # Safety
+/// The CPU must support AVX-512BW, and `bytes` must be valid UTF-8 with an
+/// ASCII prefix of `start` bytes.
+#[cfg(feature = "avx512")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
+    const LANES: usize = 64;
+    const CHUNK: usize = LANES * 4;
+
+    // SAFETY: the caller checked AVX-512BW. Each full-vector load stays
+    // within the input, and the masked load reads only the last nb bytes.
+    unsafe {
+        let mut sptr = bytes.as_ptr().add(start);
+        let mut nb = bytes.len() - start;
+
+        let zero = _mm512_setzero_si512();
+        let nibble = _mm512_set1_epi8(0x0F);
+        let cont = _mm512_set1_epi8(0x80_u8 as i8);
+        let table = _mm512_broadcast_i32x4(_mm_loadu_si128(
+            crate::UNITS_BY_HIGH_NIBBLE.as_ptr() as *const __m128i
+        ));
+
+        let load = |p: *const u8| _mm512_loadu_si512(p as *const __m512i);
+        macro_rules! units {
+            ($v:expr) => {
+                _mm512_shuffle_epi8(table, _mm512_and_si512(_mm512_srli_epi16::<4>($v), nibble))
+            };
+        }
+        // Sums of full batches, as eight u64 lanes.
+        let mut total = zero;
+        let (mut a0, mut a1) = (zero, zero);
+        // Two accumulators, as in the AVX2 kernel.
+        macro_rules! chunk {
+            () => {
+                a0 = _mm512_add_epi8(a0, units!(load(sptr)));
+                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES))));
+                a0 = _mm512_add_epi8(a0, units!(load(sptr.add(LANES * 2))));
+                a1 = _mm512_add_epi8(a1, units!(load(sptr.add(LANES * 3))));
+                sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
+            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: sum now so the lanes can't overflow.
+            total = _mm512_add_epi64(total, _mm512_sad_epu8(_mm512_add_epi8(a0, a1), zero));
+            (a0, a1) = (zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
+        }
+        while nb >= LANES {
+            a0 = _mm512_add_epi8(a0, units!(load(sptr)));
+            sptr = sptr.add(LANES);
+            nb -= LANES;
+        }
+        if nb > 0 {
+            // Masked-off lanes take a continuation byte, which counts nothing.
+            let keep: __mmask64 = (1u64 << nb) - 1;
+            a1 = _mm512_add_epi8(
+                a1,
+                units!(_mm512_mask_loadu_epi8(cont, keep, sptr as *const i8)),
+            );
+        }
+
+        total = _mm512_add_epi64(total, _mm512_sad_epu8(_mm512_add_epi8(a0, a1), zero));
+        start + _mm512_reduce_add_epi64(total) as usize
     }
 }
