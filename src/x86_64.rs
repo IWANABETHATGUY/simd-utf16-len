@@ -10,9 +10,9 @@
 //! with fewer than `WIDE_MIN` bytes after their ASCII prefix stay on the SSE2
 //! kernel inlined into the dispatch: a wider kernel's call, upper-register
 //! cleanup, and wider reduction cost more than they save there. The dispatch
-//! and the kernels are generic over a parameter they never read, so that
-//! each crate calling `utf16_len` holds and directly reaches its own copies;
-//! see `non_ascii`.
+//! and the kernels are generic over a parameter they never read, so that a
+//! crate inlining `utf16_len` holds and directly reaches its own copies; see
+//! `non_ascii`.
 
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -36,10 +36,14 @@ const AVX512_MIN: usize = 256;
 
 /// Compute the number of UTF-16 code units for UTF-8 string.
 ///
-/// Inlined into callers, which get the ASCII scan and its early return
-/// without a call, and reach their crate's own instance of `non_ascii` with a
-/// direct call.
-#[inline]
+/// On Windows and Apple targets, inlined into callers, which get the ASCII
+/// scan and its early return without a call, and reach their crate's own
+/// instance of `non_ascii` with a direct call: `ascii` measured 11 to 18%
+/// faster there. Elsewhere it stays a call into this crate, since
+/// position-independent code reaches this crate's kernel selector through
+/// the global offset table, two dependent loads that measured the mid-size
+/// non-ASCII inputs 4 to 14% slower on Linux, more than inlining gains.
+#[cfg_attr(any(windows, target_vendor = "apple"), inline)]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let start = crate::ascii::ascii_prefix_len(bytes);
@@ -55,14 +59,15 @@ pub fn utf16_len(s: &str) -> usize {
 /// json-escape-simd's dispatch.
 ///
 /// This and the kernels it jumps to are generic over `LOCAL`, which nothing
-/// reads, so that each crate calling `utf16_len` instantiates its own copies
+/// reads, so that each crate inlining `utf16_len` instantiates its own copies
 /// and reaches them directly. In position-independent code, another crate's
 /// function is called through the global offset table, which measured the
-/// mid-size non-ASCII inputs 8 to 18% slower on Linux. Callers get `true`
-/// instances; this crate holds only `false` ones, for `kernels`, since had
-/// it a `true` instance, its callers would link to that one instead of
-/// instantiating their own. Never inlined, so callers hold only the ASCII
-/// scan; every call from here is a tail call, so this saves no registers.
+/// mid-size non-ASCII inputs 8 to 18% slower on Linux. `utf16_len` uses
+/// `true` instances and `kernels` `false` ones: had this crate a `true`
+/// instance where `utf16_len` is inlined, its callers would link to that one
+/// instead of instantiating their own. Never inlined, so callers hold only
+/// the ASCII scan; every call from here is a tail call, so this saves no
+/// registers.
 #[inline(never)]
 fn non_ascii<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,

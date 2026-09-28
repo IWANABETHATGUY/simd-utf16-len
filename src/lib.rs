@@ -43,7 +43,7 @@ macro_rules! short_vector {
             // Rare: the bytes end within a vector of their page's end. A
             // branch, rather than selects, keeps the common case's registers
             // free, which on Windows saves a callee-saved push in every call.
-            // On x86_64 the kernels are instantiated in the calling crate,
+            // On x86_64 the kernels may be instantiated in the calling crate,
             // where a call to this crate's `cold` would be a real call, with
             // registers saved around it, so the hint marks the branch instead.
             #[cfg(target_arch = "x86_64")]
@@ -79,7 +79,7 @@ mod wasm32;
 mod scalar;
 
 /// Defines a lookup table for the kernels: a constant on x86_64, where the
-/// kernels are instantiated in the calling crate, which then holds its own
+/// kernels may be instantiated in the calling crate, which then holds its own
 /// copy of the table and addresses it directly (in position-independent
 /// code, another crate's static is reached through the global offset table,
 /// one more dependent load); a static elsewhere, where the kernels inline
