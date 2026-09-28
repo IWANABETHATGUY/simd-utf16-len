@@ -34,6 +34,12 @@ const WIDE_MIN: usize = 64;
 #[cfg(feature = "avx512")]
 const AVX512_MIN: usize = 256;
 
+/// From this many bytes, the widest kernel this CPU supports skips the ASCII
+/// prefix itself, 128 bytes per iteration with AVX2 and 256 with AVX-512,
+/// and counts from the first block holding a non-ASCII byte, instead of the
+/// SSE2 scan's 64 bytes per iteration.
+const LONG_MIN: usize = 256;
+
 /// Compute the number of UTF-16 code units for UTF-8 string.
 ///
 /// On Windows and Apple targets, inlined into callers, which get the ASCII
@@ -46,11 +52,42 @@ const AVX512_MIN: usize = 256;
 #[cfg_attr(any(windows, target_vendor = "apple"), inline)]
 pub fn utf16_len(s: &str) -> usize {
     let bytes = s.as_bytes();
+    if bytes.len() >= LONG_MIN {
+        return long::<true>(bytes);
+    }
     let start = crate::ascii::ascii_prefix_len(bytes);
     if start == bytes.len() {
         start
     } else {
         non_ascii::<true>(bytes, start)
+    }
+}
+
+/// Counts an input of at least `LONG_MIN` bytes with the widest kernel this
+/// CPU supports, which skips the ASCII prefix at its own width. Generic and
+/// never inlined, like `non_ascii` and for the same reasons.
+#[inline(never)]
+fn long<const LOCAL: bool>(bytes: &[u8]) -> usize {
+    // SAFETY: bytes comes from a valid str of at least LONG_MIN bytes, SSE2
+    // is baseline on x86_64, and `detect` stores a kernel only after
+    // detecting its features.
+    unsafe {
+        match WIDE_KERNEL.load(Ordering::Relaxed) {
+            #[cfg(feature = "avx512")]
+            AVX512 => utf16_len_avx512_long::<LOCAL>(bytes),
+            #[cfg(not(feature = "avx512"))]
+            AVX512 => utf16_len_avx2_long::<LOCAL>(bytes),
+            AVX2 => utf16_len_avx2_long::<LOCAL>(bytes),
+            SSE2 => {
+                let start = crate::ascii::ascii_prefix_len(bytes);
+                if start == bytes.len() {
+                    start
+                } else {
+                    utf16_len_sse2_long::<LOCAL>(bytes, start)
+                }
+            }
+            _ => detect_then_long::<LOCAL>(bytes),
+        }
     }
 }
 
@@ -99,11 +136,10 @@ const SSE2: u8 = 1;
 const AVX2: u8 = 2;
 const AVX512: u8 = 3;
 
-/// Detects the CPU's features once, then counts with the kernel they select.
-/// Generic like `non_ascii`, and for the same reason.
+/// Detects the CPU's features once and stores the widest kernel they allow.
 #[cold]
 #[inline(never)]
-fn detect_then_count<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
+fn detect() {
     let kernel = if cfg!(feature = "avx512") && is_x86_feature_detected!("avx512bw") {
         AVX512
     } else if is_x86_feature_detected!("avx2") {
@@ -112,7 +148,23 @@ fn detect_then_count<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
         SSE2
     };
     WIDE_KERNEL.store(kernel, Ordering::Relaxed);
+}
+
+/// Detects the CPU's features once, then counts with the kernel they select.
+/// Generic like `non_ascii`, and for the same reason.
+#[cold]
+#[inline(never)]
+fn detect_then_count<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
+    detect();
     non_ascii::<LOCAL>(bytes, start)
+}
+
+/// `detect_then_count` for `long`.
+#[cold]
+#[inline(never)]
+fn detect_then_long<const LOCAL: bool>(bytes: &[u8]) -> usize {
+    detect();
+    long::<LOCAL>(bytes)
 }
 
 /// The SSE2 kernel out of line, for long inputs on CPUs without AVX2, so
@@ -172,6 +224,9 @@ fn sse2(s: &str) -> usize {
 
 fn avx2(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX2.
+    if s.len() >= LONG_MIN {
+        return unsafe { utf16_len_avx2_long::<false>(s.as_bytes()) };
+    }
     with_kernel(s, |bytes, start| unsafe {
         utf16_len_avx2::<false>(bytes, start)
     })
@@ -180,6 +235,9 @@ fn avx2(s: &str) -> usize {
 #[cfg(feature = "avx512")]
 fn avx512(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX-512BW.
+    if s.len() >= LONG_MIN {
+        return unsafe { utf16_len_avx512_long::<false>(s.as_bytes()) };
+    }
     with_kernel(s, |bytes, start| unsafe {
         utf16_len_avx512::<false>(bytes, start)
     })
@@ -362,6 +420,73 @@ unsafe fn utf16_len_avx2<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize
         );
         let sum = _mm_add_epi64(sum, _mm_srli_si128::<8>(sum));
         start + _mm_cvtsi128_si64(sum) as usize
+    }
+}
+
+/// The AVX2 kernel for long inputs: skips 128-byte blocks holding only
+/// ASCII, then counts from the first block that holds a non-ASCII byte. The
+/// block's ASCII bytes count one unit each like any other, so the kernel
+/// needs no exact prefix.
+///
+/// # Safety
+/// The CPU must support AVX2, and `bytes` must be valid UTF-8 of at least
+/// `LONG_MIN` bytes.
+#[target_feature(enable = "avx2")]
+unsafe fn utf16_len_avx2_long<const LOCAL: bool>(bytes: &[u8]) -> usize {
+    const BLOCK: usize = 128;
+
+    let ptr = bytes.as_ptr();
+    let full = bytes.len() & !(BLOCK - 1);
+    let mut start = 0;
+    // SAFETY: the caller checked AVX2, and start + BLOCK <= full <=
+    // bytes.len() throughout the loop.
+    unsafe {
+        let load = |p: *const u8| _mm256_loadu_si256(p as *const __m256i);
+        while start < full {
+            let p = ptr.add(start);
+            let any = _mm256_or_si256(
+                _mm256_or_si256(load(p), load(p.add(32))),
+                _mm256_or_si256(load(p.add(64)), load(p.add(96))),
+            );
+            if _mm256_movemask_epi8(any) != 0 {
+                break;
+            }
+            start += BLOCK;
+        }
+        utf16_len_avx2::<LOCAL>(bytes, start)
+    }
+}
+
+/// The AVX-512BW kernel for long inputs, as `utf16_len_avx2_long` with
+/// 256-byte blocks.
+///
+/// # Safety
+/// The CPU must support AVX-512BW, and `bytes` must be valid UTF-8 of at
+/// least `LONG_MIN` bytes.
+#[cfg(feature = "avx512")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn utf16_len_avx512_long<const LOCAL: bool>(bytes: &[u8]) -> usize {
+    const BLOCK: usize = 256;
+
+    let ptr = bytes.as_ptr();
+    let full = bytes.len() & !(BLOCK - 1);
+    let mut start = 0;
+    // SAFETY: the caller checked AVX-512BW, and start + BLOCK <= full <=
+    // bytes.len() throughout the loop.
+    unsafe {
+        let load = |p: *const u8| _mm512_loadu_si512(p as *const __m512i);
+        while start < full {
+            let p = ptr.add(start);
+            let any = _mm512_or_si512(
+                _mm512_or_si512(load(p), load(p.add(64))),
+                _mm512_or_si512(load(p.add(128)), load(p.add(192))),
+            );
+            if _mm512_movepi8_mask(any) != 0 {
+                break;
+            }
+            start += BLOCK;
+        }
+        utf16_len_avx512::<LOCAL>(bytes, start)
     }
 }
 
