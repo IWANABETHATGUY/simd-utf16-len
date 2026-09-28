@@ -34,3 +34,20 @@ pub fn all() -> Vec<(&'static str, String)> {
         ("late_non_ascii", format!("{long_ascii}é")),
     ]
 }
+
+/// Inputs shorter than a 64-byte block, the lengths of identifiers and short
+/// literals. The Perf A/B harness measures them on top of `all`; the README
+/// table and CodSpeed keep to `all`, as in the original repository.
+pub fn short() -> Vec<(&'static str, String)> {
+    vec![
+        // Shorter than one 16-byte vector.
+        ("ascii_tiny", "hello world".to_owned()),
+        ("utf8_tiny", "héllo wörld".to_owned()),
+        // Shorter than one 64-byte ASCII block.
+        (
+            "ascii_short",
+            "The quick brown fox jumps over the lazy dog.".to_owned(),
+        ),
+        ("utf8_short", "Привет, мир! Как дела сегодня?".to_owned()),
+    ]
+}
