@@ -9,7 +9,10 @@
 //! SSE2 has no byte shuffle, so it compares, one vector per iteration. Inputs
 //! with fewer than `WIDE_MIN` bytes after their ASCII prefix stay on the SSE2
 //! kernel inlined into the dispatch: a wider kernel's call, upper-register
-//! cleanup, and wider reduction cost more than they save there.
+//! cleanup, and wider reduction cost more than they save there. The dispatch
+//! and the kernels are generic over a parameter they never read, so that
+//! each crate calling `utf16_len` holds and directly reaches its own copies;
+//! see `non_ascii`.
 
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -51,13 +54,15 @@ pub fn utf16_len(s: &str) -> usize {
 /// here, longer ones jump to the widest kernel this CPU supports, as in
 /// json-escape-simd's dispatch.
 ///
-/// Generic over `LOCAL`, which nothing reads, so that each crate calling
-/// `utf16_len` instantiates its own copy (a `true` one) and calls it
-/// directly. A call to another crate's function is made through the global
-/// offset table in position-independent code, which measured the mid-size
-/// non-ASCII inputs 8 to 18% slower on Linux. Never inlined, so callers hold
-/// only the ASCII scan; every call from here is a tail call, so this saves
-/// no registers.
+/// This and the kernels it jumps to are generic over `LOCAL`, which nothing
+/// reads, so that each crate calling `utf16_len` instantiates its own copies
+/// and reaches them directly. In position-independent code, another crate's
+/// function is called through the global offset table, which measured the
+/// mid-size non-ASCII inputs 8 to 18% slower on Linux. Callers get `true`
+/// instances; this crate holds only `false` ones, for `kernels`, since had
+/// it a `true` instance, its callers would link to that one instead of
+/// instantiating their own. Never inlined, so callers hold only the ASCII
+/// scan; every call from here is a tail call, so this saves no registers.
 #[inline(never)]
 fn non_ascii<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
     // SAFETY: bytes comes from a valid str, start is a verified ASCII prefix,
@@ -69,9 +74,9 @@ fn non_ascii<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
         if nb >= WIDE_MIN {
             return match WIDE_KERNEL.load(Ordering::Relaxed) {
                 #[cfg(feature = "avx512")]
-                AVX512 if nb >= AVX512_MIN => utf16_len_avx512(bytes, start),
-                AVX2 | AVX512 => utf16_len_avx2(bytes, start),
-                SSE2 => utf16_len_sse2_long(bytes, start),
+                AVX512 if nb >= AVX512_MIN => utf16_len_avx512::<LOCAL>(bytes, start),
+                AVX2 | AVX512 => utf16_len_avx2::<LOCAL>(bytes, start),
+                SSE2 => utf16_len_sse2_long::<LOCAL>(bytes, start),
                 _ => detect_then_count::<LOCAL>(bytes, start),
             };
         }
@@ -90,9 +95,7 @@ const AVX2: u8 = 2;
 const AVX512: u8 = 3;
 
 /// Detects the CPU's features once, then counts with the kernel they select.
-/// Generic like `non_ascii`, and for the same reason: were this crate to
-/// instantiate `non_ascii::<true>`, its callers would link to that instance
-/// instead of instantiating their own.
+/// Generic like `non_ascii`, and for the same reason.
 #[cold]
 #[inline(never)]
 fn detect_then_count<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
@@ -113,7 +116,7 @@ fn detect_then_count<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
 /// # Safety
 /// `bytes` must be valid UTF-8 with an ASCII prefix of `start` bytes.
 #[inline(never)]
-unsafe fn utf16_len_sse2_long(bytes: &[u8], start: usize) -> usize {
+unsafe fn utf16_len_sse2_long<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
     // SAFETY: the caller's contract, and SSE2 is baseline on x86_64.
     unsafe { utf16_len_sse2(bytes, start) }
 }
@@ -164,13 +167,17 @@ fn sse2(s: &str) -> usize {
 
 fn avx2(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX2.
-    with_kernel(s, |bytes, start| unsafe { utf16_len_avx2(bytes, start) })
+    with_kernel(s, |bytes, start| unsafe {
+        utf16_len_avx2::<false>(bytes, start)
+    })
 }
 
 #[cfg(feature = "avx512")]
 fn avx512(s: &str) -> usize {
     // SAFETY: `kernels` only lists this after detecting AVX-512BW.
-    with_kernel(s, |bytes, start| unsafe { utf16_len_avx512(bytes, start) })
+    with_kernel(s, |bytes, start| unsafe {
+        utf16_len_avx512::<false>(bytes, start)
+    })
 }
 
 /// SSE2 kernel, `#[inline(always)]` so short inputs run it inside `non_ascii`
@@ -268,7 +275,7 @@ unsafe fn utf16_len_sse2(bytes: &[u8], start: usize) -> usize {
 /// The CPU must support AVX2, and `bytes` must be valid UTF-8 with an ASCII
 /// prefix of `start` bytes.
 #[target_feature(enable = "avx2")]
-unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
+unsafe fn utf16_len_avx2<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 32;
     const CHUNK: usize = LANES * 4;
 
@@ -362,7 +369,7 @@ unsafe fn utf16_len_avx2(bytes: &[u8], start: usize) -> usize {
 /// ASCII prefix of `start` bytes.
 #[cfg(feature = "avx512")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn utf16_len_avx512(bytes: &[u8], start: usize) -> usize {
+unsafe fn utf16_len_avx512<const LOCAL: bool>(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 64;
     const CHUNK: usize = LANES * 4;
 
