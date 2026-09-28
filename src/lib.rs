@@ -5,6 +5,11 @@
 //! Where:
 //! - continuation bytes: `(byte & 0xC0) == 0x80`
 //! - four-byte leaders: `byte >= 0xF0`
+//!
+//! The SIMD kernels follow napi-rs/json-escape-simd's `src/simd`: a pointer
+//! cursor with a remaining-byte count, unrolled vectors per iteration, an
+//! in-register tail, and for inputs shorter than one vector a full-vector
+//! load that stays within the memory page instead of a copy.
 
 #[cfg(any(
     target_arch = "x86_64",
@@ -73,6 +78,7 @@ mod scalar;
 /// pair. The table-lookup kernels shuffle this by the high nibble, the way
 /// json-escape-simd's nibble-table classifier does.
 #[cfg(any(
+    target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128"),
 ))]
