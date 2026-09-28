@@ -11,6 +11,10 @@ on:
         description: Base ref to compare against (empty means the parent commit, HEAD measures the no-change spread)
         required: false
         default: ""
+      head_features:
+        description: Crate features to enable on the head side only, comma-separated (for example avx512)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -42,6 +46,7 @@ jobs:
           PUSH_BEFORE: ${{ github.event.before }}
           DISPATCH_BASE: ${{ inputs.base }}
           AB_HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          AB_HEAD_FEATURES: ${{ inputs.head_features }}
           # The label accepts an intended slowdown.
           FAIL_ABOVE: ${{ !contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') && '5' || '' }}
         run: |
