@@ -47,7 +47,13 @@ build_side() {
   mkdir -p "$tree/perf/ab"
   cp "$root/perf/ab/Cargo.toml" "$tree/perf/ab/"
   cp -R "$root/perf/ab/src" "$tree/perf/ab/src"
-  cargo build --release --quiet --manifest-path "$tree/perf/ab/Cargo.toml" --target-dir "$root/target/ab-build-$1"
+  local features=""
+  if [ "$1" = head ] && [ -n "${AB_HEAD_FEATURES:-}" ]; then
+    # Crate features for the head side only, so an opt-in feature can be
+    # measured against a base that doesn't have it.
+    features="simd-utf16-len/$AB_HEAD_FEATURES"
+  fi
+  cargo build --release --quiet --manifest-path "$tree/perf/ab/Cargo.toml" --target-dir "$root/target/ab-build-$1" ${features:+--features "$features"}
 }
 
 # The working tree as a tree object, so head builds from the same path as base.
@@ -65,6 +71,9 @@ AB_BASE_LABEL=$(git -C "$root" rev-parse --short "$base_ref^{commit}")
 AB_HEAD_LABEL=$(git -C "$root" rev-parse --short "${AB_HEAD_REF:-HEAD}^{commit}")
 if ! git -C "$root" diff --quiet HEAD --; then
   AB_HEAD_LABEL="$AB_HEAD_LABEL with local changes"
+fi
+if [ -n "${AB_HEAD_FEATURES:-}" ]; then
+  AB_HEAD_LABEL="$AB_HEAD_LABEL with $AB_HEAD_FEATURES"
 fi
 export AB_BASE_LABEL AB_HEAD_LABEL
 
