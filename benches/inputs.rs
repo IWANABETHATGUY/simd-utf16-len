@@ -12,19 +12,11 @@ pub const EMOJI: &str = "Hello 🌍🌎🌏! Flags: 🇺🇸🇬🇧🇯🇵🇨
 
 pub const MIXED: &str = "Hello, 世界! 🌍 Привет мир! こんにちは世界！Héllo wörld! 你好世界！안녕하세요 세계! مرحبا بالعالم";
 
-/// Every input, from a few bytes to about 11 KB.
+/// Every input, from 144 bytes to about 11 KB: nothing shorter, as in the
+/// original repository's benchmarks.
 pub fn all() -> Vec<(&'static str, String)> {
     let long_ascii = ASCII.repeat(64);
     vec![
-        // Shorter than one 16-byte vector.
-        ("ascii_tiny", "hello world".to_owned()),
-        ("utf8_tiny", "héllo wörld".to_owned()),
-        // Shorter than one 64-byte ASCII block, so the ASCII scan works a word at a time.
-        (
-            "ascii_short",
-            "The quick brown fox jumps over the lazy dog.".to_owned(),
-        ),
-        ("utf8_short", "Привет, мир! Как дела сегодня?".to_owned()),
         ("ascii", ASCII.to_owned()),
         ("cjk", CJK.to_owned()),
         ("emoji", EMOJI.to_owned()),

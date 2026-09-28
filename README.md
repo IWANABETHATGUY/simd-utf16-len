@@ -57,10 +57,6 @@ The speedups below are from [run 36311375947](https://github.com/IWANABETHATGUY/
 
 | Input | Bytes | Linux x86_64 | Linux aarch64 | macOS aarch64 |
 |:------|------:|-------------:|--------------:|--------------:|
-| ascii_tiny | 11 | 1.0x | 0.7x | 0.8x |
-| utf8_tiny | 13 | 0.7x | 0.8x | 0.9x |
-| ascii_short | 44 | 0.7x | 0.8x | 0.9x |
-| utf8_short | 53 | 2.7x | 3.0x | 3.1x |
 | ascii | 169 | 6.6x | 1.7x | 2.1x |
 | cjk | 194 | 7.9x | 8.3x | 9.9x |
 | emoji | 170 | 6.4x | 6.1x | 7.4x |
@@ -74,7 +70,7 @@ The speedups below are from [run 36311375947](https://github.com/IWANABETHATGUY/
 | early_non_ascii | 10818 | 21.6x | 15.6x | 15.6x |
 | late_non_ascii | 10818 | 40.5x | 35.7x | 49.9x |
 
-The baseline ties or wins on the inputs of 44 bytes or less (`ascii_tiny`, `utf8_tiny`, and `ascii_short`). On x86_64, its `is_ascii` also beats this crate's ASCII scan on the 10,816-byte ASCII input. Results depend on input length, character distribution, CPU, and compiler, so these ratios don't promise a speedup for every string or platform.
+On x86_64, the baseline's `is_ascii` beats this crate's ASCII scan on the 10,816-byte ASCII input. Results depend on input length, character distribution, CPU, and compiler, so these ratios don't promise a speedup for every string or platform.
 
 ### Reproduce locally
 
