@@ -13,26 +13,42 @@
 ))]
 mod ascii;
 
+/// The vector holding an input shorter than `$lanes` bytes from its last
+/// `nb` bytes on, and the mask of those `nb` lanes, as `$load` produces them.
+///
+/// A full-vector load forward from the last `nb` bytes can't fault when it
+/// stays within their page. Otherwise the vector that ends at the input's end
+/// starts before the input but within the same page, so it can't fault either.
+/// Debug builds, Miri, and wasm32 copy the bytes into a zeroed placeholder
+/// instead.
+///
+/// Must be expanded inside an `unsafe` block, with `$sptr` pointing at the
+/// input's last `nb` bytes, `0 < nb < $lanes`, and `$lanes <= 64`.
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128"),
 ))]
-/// Count the tail after skipping continuation bytes at `i`.
-/// The caller has already counted each preceding leader's full UTF-16 contribution.
-///
-/// # Safety
-/// `bytes` must be valid UTF-8, and `i <= bytes.len()`.
-#[inline(always)]
-unsafe fn utf16_len_tail(bytes: &[u8], i: usize) -> usize {
-    let mut tail_start = i;
-    // SAFETY: the length check guards each byte access.
-    while tail_start < bytes.len() && (unsafe { *bytes.get_unchecked(tail_start) } & 0xC0) == 0x80 {
-        tail_start += 1;
-    }
-    // SAFETY: bytes is valid UTF-8, and tail_start <= bytes.len() is a char boundary.
-    let tail = unsafe { std::str::from_utf8_unchecked(bytes.get_unchecked(tail_start..)) };
-    tail.encode_utf16().count()
+macro_rules! short_vector {
+    ($sptr:expr, $nb:expr, $lanes:expr, $load:expr) => {{
+        let (sptr, nb): (*const u8, usize) = ($sptr, $nb);
+        if crate::OVERREAD && crate::fits_in_page(sptr, $lanes) {
+            ($load(sptr), $load(crate::keep_first(nb)))
+        } else if crate::OVERREAD {
+            // Rare: the bytes end within a vector of their page's end. A
+            // branch, rather than selects, keeps the common case's registers
+            // free, which on Windows saves a callee-saved push in every call.
+            crate::cold();
+            (
+                $load(sptr.wrapping_add(nb).wrapping_sub($lanes)),
+                $load(crate::keep_last($lanes, nb)),
+            )
+        } else {
+            let mut placeholder = [0u8; $lanes];
+            std::ptr::copy_nonoverlapping(sptr, placeholder.as_mut_ptr(), nb);
+            ($load(placeholder.as_ptr()), $load(crate::keep_first(nb)))
+        }
+    }};
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -50,6 +66,93 @@ mod wasm32;
     all(target_arch = "wasm32", target_feature = "simd128"),
 )))]
 mod scalar;
+
+/// Lane masks for the last vector: 64 zero bytes, 64 `0xFF` bytes, 64 zero
+/// bytes. `keep_last` and `keep_first` load a window of it, so the tail
+/// needs no runtime broadcast and compare.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+static KEEP: [u8; 192] = {
+    let mut keep = [0u8; 192];
+    let mut i = 64;
+    while i < 128 {
+        keep[i] = 0xFF;
+        i += 1;
+    }
+    keep
+};
+
+/// A `lanes`-byte mask that is `0xFF` in only its last `nb` lanes, for the
+/// overlapping load of the last `lanes` bytes when only `nb` are uncounted.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+fn keep_last(lanes: usize, nb: usize) -> *const u8 {
+    debug_assert!(lanes <= 64 && 0 < nb && nb < lanes);
+    KEEP.as_ptr().wrapping_add(64 - lanes + nb)
+}
+
+/// A mask that is `0xFF` in only its first `nb` lanes, for a vector loaded
+/// forward from the last `nb` bytes.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+fn keep_first(nb: usize) -> *const u8 {
+    debug_assert!(0 < nb && nb < 64);
+    KEEP.as_ptr().wrapping_add(128 - nb)
+}
+
+/// Whether an input shorter than one vector may be read with a full-vector
+/// load that reaches past its end, as napi-rs/json-escape-simd does on Linux
+/// and macOS, or past its start. Windows also protects memory in 4 KiB pages.
+/// The kernels only do so when the load stays within the input's page, so it
+/// can't fault. Debug builds and Miri copy into a buffer instead, since they
+/// would flag the read, and so does wasm32, whose linear memory has no page
+/// past its end.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+const OVERREAD: bool = cfg!(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ),
+    not(debug_assertions),
+    not(miri)
+));
+
+/// Marks the branch that calls it as rarely taken.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[cold]
+#[inline(never)]
+fn cold() {}
+
+/// Whether a `lanes`-byte load at `ptr` stays within one 4 KiB page.
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+#[inline(always)]
+fn fits_in_page(ptr: *const u8, lanes: usize) -> bool {
+    (ptr as usize & 4095) + lanes <= 4096
+}
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::utf16_len;
@@ -267,6 +370,49 @@ mod tests {
             let s = &storage[..end];
             assert_eq!(utf16_len(s), reference(s), "len: {}", s.len());
         }
+    }
+
+    #[test]
+    fn short_inputs_at_page_edges() {
+        // Inputs shorter than a vector load a whole vector forward from their
+        // start when that stays within the page, otherwise backward from
+        // their end, or are copied in debug builds. Surround them with
+        // four-byte leaders, which would change the count if a load counted
+        // bytes outside the input, at every offset around a page boundary.
+        use std::alloc::{Layout, alloc, dealloc};
+        const PAGE: usize = 4096;
+        let layout = Layout::from_size_align(3 * PAGE, PAGE).unwrap();
+        // SAFETY: the layout has a non-zero size.
+        let buf = unsafe { alloc(layout) };
+        assert!(!buf.is_null());
+        // SAFETY: buf points to 3 * PAGE writable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(buf, 3 * PAGE) };
+        bytes.fill(0xF0);
+        let inputs = [
+            "a",
+            "é",
+            "中",
+            "🦀",
+            "héllo wörld",
+            "héllo wörld 中文🦀!",
+            "Привет, мир! 你好",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa中",
+        ];
+        for input in inputs {
+            for offset in (PAGE - 80..PAGE + 16).chain(2 * PAGE - 80..2 * PAGE + 16) {
+                let range = offset..offset + input.len();
+                bytes[range.clone()].copy_from_slice(input.as_bytes());
+                let s = std::str::from_utf8(&bytes[range.clone()]).unwrap();
+                assert_eq!(
+                    utf16_len(s),
+                    reference(input),
+                    "offset: {offset}, input: {input}"
+                );
+                bytes[range].fill(0xF0);
+            }
+        }
+        // SAFETY: buf came from alloc with this layout.
+        unsafe { dealloc(buf, layout) };
     }
 
     #[test]
