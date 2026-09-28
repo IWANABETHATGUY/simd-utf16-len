@@ -1,6 +1,18 @@
 //! NEON-based UTF-16 length calculation (always available on aarch64).
+//!
+//! Shaped like napi-rs/json-escape-simd's kernels: a pointer cursor with a
+//! remaining-byte count, four unrolled vectors per iteration counted into
+//! four byte-lane accumulators, leftover vectors and an in-register tail
+//! folded into the same accumulators, and one horizontal sum. Inputs of
+//! fewer than four vectors skip the accumulators and count into one.
 
 use std::arch::aarch64::*;
+
+/// Iterations of four vectors between two sums of the byte-lane
+/// accumulators. A lane gains at most 2 per vector, so the merged
+/// accumulators hold at most 4 * 2 * 30 = 240 after a batch, which leaves
+/// room for 3 leftover vectors and the tail: 240 + 3 * 2 + 2 = 248 < 256.
+const MAX_BATCH: usize = 30;
 
 /// Compute the number of UTF-16 code units for UTF-8 string using NEON.
 #[inline]
@@ -26,9 +38,7 @@ pub fn utf16_len(s: &str) -> usize {
 #[inline(always)]
 unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
     const LANES: usize = 16;
-    /// A lane of either accumulator gains at most 1 per vector, so this many
-    /// vectors and the tail fit before a sum.
-    const MAX_BATCH: usize = 254;
+    const CHUNK: usize = LANES * 4;
 
     // SAFETY: NEON is baseline on aarch64. Each full-vector load stays within
     // the input, the mask table, or the placeholder, except the short-input
@@ -39,66 +49,95 @@ unsafe fn utf16_len_neon(bytes: &[u8], start: usize) -> usize {
         let mut nb = len - start;
 
         let zero = vdupq_n_u8(0);
-        let cont_mask = vdupq_n_u8(0xC0);
-        let cont_val = vdupq_n_u8(0x80);
-        let four_threshold = vdupq_n_u8(0xEF);
-        let one = vdupq_n_u8(1);
+        let cont_max = vdupq_n_s8(0xBF_u8 as i8);
+        let four_min = vdupq_n_u8(0xF0);
 
-        // Every byte contributes one unit, except continuation bytes, which
-        // contribute none, and four-byte leaders, which contribute two: count
-        // both kinds and adjust the byte count at the end.
-        let (mut cont_acc, mut four_acc) = (zero, zero);
-        macro_rules! count {
-            ($v:expr, $keep:expr) => {{
+        // Minus the units each byte contributes: 0xFF (-1) for a leader (any
+        // byte above the continuation range, compared as signed bytes), and
+        // -1 more for a four-byte leader.
+        macro_rules! neg_units {
+            ($v:expr) => {{
                 let v = $v;
-                // Continuation bytes: (byte & 0xC0) == 0x80, as 0xFF lanes.
-                let is_cont = vceqq_u8(vandq_u8(v, cont_mask), cont_val);
-                // Four-byte leaders (byte >= 0xF0): saturating subtract 0xEF
-                // gives non-zero only for them, then clamp to 1 with min.
-                let is_four = vminq_u8(vqsubq_u8(v, four_threshold), one);
-                cont_acc = vsubq_u8(cont_acc, $keep(is_cont));
-                four_acc = vaddq_u8(four_acc, $keep(is_four));
+                vaddq_u8(
+                    vcgtq_s8(vreinterpretq_s8_u8(v), cont_max),
+                    vcgeq_u8(v, four_min),
+                )
+            }};
+        }
+        // Minus the units of the last nb bytes, from the vector that ends at
+        // the input's end, which holds at least a vector: only its last nb
+        // lanes are uncounted, and byte-wise counting needs no UTF-8 boundary
+        // care.
+        macro_rules! neg_tail_units {
+            () => {{
+                let v = vld1q_u8(sptr.add(nb).sub(LANES));
+                vandq_u8(neg_units!(v), vld1q_u8(crate::keep_last(LANES, nb)))
             }};
         }
 
         if len < LANES {
             // The whole input is shorter than a vector.
             let (v, keep) = short_vector!(sptr, nb, LANES, vld1q_u8);
-            count!(v, |mask| vandq_u8(mask, keep));
-            return len - vaddlvq_u8(cont_acc) as usize + vaddlvq_u8(four_acc) as usize;
+            let acc = vsubq_u8(zero, vandq_u8(neg_units!(v), keep));
+            return start + vaddlvq_u8(acc) as usize;
         }
 
-        // Full vectors in batches, as the compiler unrolls a counted loop;
-        // besides the accumulators, only the cursor, the remaining count, and
-        // the running sums stay live across it.
-        let all = |mask| mask;
-        let (mut continuations, mut fours) = (0, 0);
-        loop {
-            let batch = (nb / LANES).min(MAX_BATCH);
-            for _ in 0..batch {
-                count!(vld1q_u8(sptr), all);
+        if nb < CHUNK {
+            // Fewer than four vectors: one accumulator, one sum.
+            let mut acc = zero;
+            while nb >= LANES {
+                acc = vsubq_u8(acc, neg_units!(vld1q_u8(sptr)));
                 sptr = sptr.add(LANES);
+                nb -= LANES;
             }
-            nb -= batch * LANES;
-            if nb < LANES {
-                break;
+            if nb > 0 {
+                acc = vsubq_u8(acc, neg_tail_units!());
             }
-            // More full vectors follow: sum now so the lanes can't overflow.
-            continuations += vaddlvq_u8(cont_acc) as usize;
-            fours += vaddlvq_u8(four_acc) as usize;
-            (cont_acc, four_acc) = (zero, zero);
+            return start + vaddlvq_u8(acc) as usize;
+        }
+
+        macro_rules! merge {
+            ($a0:expr, $a1:expr, $a2:expr, $a3:expr) => {
+                vaddq_u8(vaddq_u8($a0, $a1), vaddq_u8($a2, $a3))
+            };
+        }
+
+        // Sums of full batches, widened to u32 lanes without a horizontal add.
+        let mut total = vdupq_n_u32(0);
+        let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+        macro_rules! chunk {
+            () => {
+                a0 = vsubq_u8(a0, neg_units!(vld1q_u8(sptr)));
+                a1 = vsubq_u8(a1, neg_units!(vld1q_u8(sptr.add(LANES))));
+                a2 = vsubq_u8(a2, neg_units!(vld1q_u8(sptr.add(LANES * 2))));
+                a3 = vsubq_u8(a3, neg_units!(vld1q_u8(sptr.add(LANES * 3))));
+                sptr = sptr.add(CHUNK);
+            };
+        }
+
+        while nb >= CHUNK * MAX_BATCH {
+            for _ in 0..MAX_BATCH {
+                chunk!();
+            }
+            nb -= CHUNK * MAX_BATCH;
+            // More follows: widen now so the lanes can't overflow.
+            total = vpadalq_u16(total, vpaddlq_u8(merge!(a0, a1, a2, a3)));
+            (a0, a1, a2, a3) = (zero, zero, zero, zero);
+        }
+        // Fewer than MAX_BATCH iterations remain.
+        while nb >= CHUNK {
+            chunk!();
+            nb -= CHUNK;
+        }
+        while nb >= LANES {
+            a0 = vsubq_u8(a0, neg_units!(vld1q_u8(sptr)));
+            sptr = sptr.add(LANES);
+            nb -= LANES;
         }
         if nb > 0 {
-            // The vector that ends at the input's end, which holds at least a
-            // vector: only its last nb lanes are uncounted, and byte-wise
-            // counting needs no UTF-8 boundary care.
-            let v = vld1q_u8(sptr.add(nb).sub(LANES));
-            let keep = vld1q_u8(crate::keep_last(LANES, nb));
-            count!(v, |mask| vandq_u8(mask, keep));
+            a1 = vsubq_u8(a1, neg_tail_units!());
         }
-        continuations += vaddlvq_u8(cont_acc) as usize;
-        fours += vaddlvq_u8(four_acc) as usize;
 
-        len - continuations + fours
+        start + vaddlvq_u8(merge!(a0, a1, a2, a3)) as usize + vaddvq_u32(total) as usize
     }
 }
