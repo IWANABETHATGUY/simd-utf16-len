@@ -30,3 +30,4 @@ target
 
 # Changes with the dependency path under test
 /perf/kernels/Cargo.lock
+.temp/
