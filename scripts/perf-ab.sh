@@ -37,7 +37,7 @@ tree="$root/target/ab-tree"
 
 # build_side <base|head> <tree-ish>: builds the harness against the crate in
 # that tree, into target/ab-build-<side>. Both sides use the working tree's
-# harness.
+# harness and inputs.
 build_side() {
   rm -rf "$tree"
   mkdir -p "$tree/perf/ab"
@@ -47,6 +47,8 @@ build_side() {
   mkdir -p "$tree/perf/ab"
   cp "$root/perf/ab/Cargo.toml" "$tree/perf/ab/"
   cp -R "$root/perf/ab/src" "$tree/perf/ab/src"
+  # And the working tree's inputs, so both sides measure the same list.
+  cp "$root/benches/inputs.rs" "$tree/benches/inputs.rs"
   local features=""
   if [ "$1" = head ] && [ -n "${AB_HEAD_FEATURES:-}" ]; then
     # Crate features for the head side only, so an opt-in feature can be

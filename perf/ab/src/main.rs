@@ -108,7 +108,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let inputs = inputs::all();
+    let mut inputs = inputs::all();
+    inputs.extend(inputs::short());
 
     if let Some(name) = &options.child {
         let Some((_, input)) = inputs.iter().find(|(known, _)| known == name) else {
