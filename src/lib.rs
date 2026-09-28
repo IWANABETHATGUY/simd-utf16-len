@@ -43,6 +43,12 @@ macro_rules! short_vector {
             // Rare: the bytes end within a vector of their page's end. A
             // branch, rather than selects, keeps the common case's registers
             // free, which on Windows saves a callee-saved push in every call.
+            // On x86_64 the kernels are instantiated in the calling crate,
+            // where a call to this crate's `cold` would be a real call, with
+            // registers saved around it, so the hint marks the branch instead.
+            #[cfg(target_arch = "x86_64")]
+            std::hint::cold_path();
+            #[cfg(not(target_arch = "x86_64"))]
             crate::cold();
             (
                 $load(sptr.wrapping_add(nb).wrapping_sub($lanes)),
@@ -72,35 +78,61 @@ mod wasm32;
 )))]
 mod scalar;
 
-/// UTF-16 code units each byte contributes, by its high nibble: ASCII bytes
-/// and two- or three-byte leaders count 1, continuation bytes (`0x80..=0xBF`)
-/// count 0, and four-byte leaders (`0xF0..`) count 2 for their surrogate
-/// pair. The table-lookup kernels shuffle this by the high nibble, the way
-/// json-escape-simd's nibble-table classifier does.
+/// Defines a lookup table for the kernels: a constant on x86_64, where the
+/// kernels are instantiated in the calling crate, which then holds its own
+/// copy of the table and addresses it directly (in position-independent
+/// code, another crate's static is reached through the global offset table,
+/// one more dependent load); a static elsewhere, where the kernels inline
+/// into `utf16_len` and share this crate's copy.
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128"),
 ))]
-static UNITS_BY_HIGH_NIBBLE: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 2];
+macro_rules! table {
+    ($(#[$attr:meta])* $name:ident: $ty:ty = $value:expr;) => {
+        $(#[$attr])*
+        #[cfg(target_arch = "x86_64")]
+        const $name: $ty = $value;
+        $(#[$attr])*
+        #[cfg(not(target_arch = "x86_64"))]
+        static $name: $ty = $value;
+    };
+}
 
-/// Lane masks for the last vector: 64 zero bytes, 64 `0xFF` bytes, 64 zero
-/// bytes. `keep_last` and `keep_first` load a window of it, so the tail
-/// needs no runtime broadcast and compare.
 #[cfg(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128"),
 ))]
-static KEEP: [u8; 192] = {
-    let mut keep = [0u8; 192];
-    let mut i = 64;
-    while i < 128 {
-        keep[i] = 0xFF;
-        i += 1;
-    }
-    keep
-};
+table! {
+    /// UTF-16 code units each byte contributes, by its high nibble: ASCII
+    /// bytes and two- or three-byte leaders count 1, continuation bytes
+    /// (`0x80..=0xBF`) count 0, and four-byte leaders (`0xF0..`) count 2 for
+    /// their surrogate pair. The table-lookup kernels shuffle this by the high
+    /// nibble, the way json-escape-simd's nibble-table classifier does.
+    UNITS_BY_HIGH_NIBBLE: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 2];
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+))]
+table! {
+    /// Lane masks for the last vector: 64 zero bytes, 64 `0xFF` bytes, 64
+    /// zero bytes. `keep_last` and `keep_first` load a window of it, so the
+    /// tail needs no runtime broadcast and compare.
+    KEEP: [u8; 192] = {
+        let mut keep = [0u8; 192];
+        let mut i = 64;
+        while i < 128 {
+            keep[i] = 0xFF;
+            i += 1;
+        }
+        keep
+    };
+}
 
 /// A `lanes`-byte mask that is `0xFF` in only its last `nb` lanes, for the
 /// overlapping load of the last `lanes` bytes when only `nb` are uncounted.
@@ -150,9 +182,10 @@ const OVERREAD: bool = cfg!(all(
     not(miri)
 ));
 
-/// Marks the branch that calls it as rarely taken.
+/// Marks the branch that calls it as rarely taken: the empty cold function
+/// keeps LLVM from turning the branch into selects, and the call itself is
+/// dropped. Not on x86_64; see `short_vector!`.
 #[cfg(any(
-    target_arch = "x86_64",
     target_arch = "aarch64",
     all(target_arch = "wasm32", target_feature = "simd128"),
 ))]
